@@ -1,0 +1,16 @@
+{"event":"benchmark_start","ts_ms":126392436.429,"model":"C:\Users\Owner\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":20}
+{"event":"benchmark_start","ts_ms":126724492.189,"model":"C:\Users\Owner\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":20}
+{"event":"benchmark_start","ts_ms":29688520.342,"model":"C:\Users\Owner/.ollama/models/blobs/unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}
+{"event":"benchmark_start","ts_ms":29979606.697,"model":"C:\Users\Owner/.ollama/models/blobs/unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}
+{"event":"benchmark_start","ts_ms":30565274.843,"model":"C:\Users\Owner/.ollama/models/blobs/unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}
+{"event":"benchmark_start","ts_ms":30816516.722,"model":"C:\Users\Owner/.ollama/models/blobs/unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}
+{"event":"benchmark_start","ts_ms":31187865.644,"model":"C:\Users\Owner/.ollama/models/blobs/unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}
+{"event":"benchmark_start","ts_ms":32879427.699,"model":"synthetic","tokens":1}
+{"event":"decode_step","ts_ms":32879435.306,"step":0,"dt_ms":7.192,"token":25133}
+{"event":"benchmark_done","ts_ms":32879435.591,"ok_tokens":1,"total_ms":7.523,"tok_s":132.917}
+{"event":"benchmark_start","ts_ms":32952322.436,"model":"C:\Users\Owner\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}
+{"event":"benchmark_start","ts_ms":33296894.227,"model":"C:\Users\Owner\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}
+{"event":"benchmark_start","ts_ms":35150645.384,"model":"C:\Users\Owner\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}
+{"event":"benchmark_start","ts_ms":35349869.342,"model":"C:\Users\Owner\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}
+{"event":"decode_step","ts_ms":35351683.524,"step":0,"dt_ms":1807.140,"token":248319}
+{"event":"benchmark_done","ts_ms":35351691.001,"ok_tokens":1,"total_ms":1814.111,"tok_s":0.551}

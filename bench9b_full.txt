@@ -1,0 +1,20 @@
+[tb_cuda] uploaded 154 tensors  4.29 GB to VRAM
+[benchmark] skipping generate self-test
+=== TRAILBLAZE Inference Runtime ===
+
+[tb_cuda] NVIDIA GeForce RTX 2060 sm_75  12.9 GB total  11.7 GB free
+[tb_cuda] analog dispatch: aphase->{256,128,128,64} threads  S(U)->grid+-25%  4 async streams
+[tb_gguf] tokenizer: vocab=248320 merges=247587 bos=248045 eos=248046
+[tb_gguf] C:\Users\Owner\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q3_K_XL.gguf: arch=qwen35 layers=32 hidden=4096 heads=16/4 experts=0/2 tensors=427 size=5.1GB
+[tb_gguf] tensor index: 427 tensors in 1024 slots (42% load)
+[tb_dispatch] CPU caps: AVX2=1 AVX512F=0 VNNI=0 FMA=1
+[tb_infer] Context created: hdgl=1 alpha=0.20 lattice={"epoch":20,"n_slots":512,"time":5.2000,"phase_var":0.000833,"consensus":false,"M_U":0.9992,"Lambda_U":12.6531,"S_U":0.8880,"seed":"0x00000000cafebabe"}
+
+[test] HDGL routing: ON (alpha=0.20)
+[routing] token=42 layer=0 ΓåÆ experts=[0(0.534),5(0.466)] hdgl_expert=0 octave=7
+
+[lattice] S(U)=0.8880 ╬¢=12.6531 M=0.9992
+
+[benchmark] 20 decode calls...
+[benchmark] telemetry log: bench_hdglsql.jsonl
+[tb_infer] KV cache allocated: slot=0 32 layers 4 kv-heads max_seq=4096

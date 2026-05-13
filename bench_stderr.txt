@@ -1,0 +1,1 @@
+[tb_cuda] uploaded 154 tensors  4.29 GB to VRAM

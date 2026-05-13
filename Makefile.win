@@ -1,0 +1,110 @@
+# TRAILBLAZE — Native Windows Build (MSVC + CUDA 13.2)
+#
+# Usage:
+#   nmake -f Makefile.win
+#   nmake -f Makefile.win benchmark
+#   nmake -f Makefile.win clean
+#
+# Requirements:
+#   - MSVC via "x64 Native Tools Command Prompt for VS 2022"
+#     (or any VS version with cl.exe on PATH)
+#   - CUDA Toolkit 13.2 at C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2
+#
+# The build produces:
+#   bin\tb_infer.exe  — full 6-layer Ollama+CUDA replacement, GPU-accelerated
+
+CUDA_PATH = C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2
+NVCC      = "$(CUDA_PATH)\bin\nvcc.exe"
+# Auto-detected VS 2022 Build Tools; nmake runs from "x64 Native Tools" prompt if cl.exe not on PATH
+CC        = cl.exe
+MSVC_BIN  = C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64
+BINDIR    = bin
+OBJDIR    = obj
+
+# ── Compiler flags ────────────────────────────────────────────────────────
+# /DTB_CUDA       — enables CUDA dispatch in tb_gguf.c
+# /DTB_INFER_MAIN — builds the inference server entry point
+# /D_CRT_SECURE_NO_WARNINGS — suppress MSVC fopen/sprintf warnings
+CCFLAGS = /O2 /arch:AVX2 /fp:fast /std:c11 /W3 /WX- \
+          /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 \
+          /DTB_CUDA /DTB_INFER_TEST \
+          /Ilayer0 /Ilayer1 /Ilayer2 /Ilayer3 /Ilayer4 /Ilayer5 /Iinclude /Isrc \
+          /I"$(CUDA_PATH)\include"
+
+# ── NVCC flags ────────────────────────────────────────────────────────────
+# sm_75 = RTX 2060 / 2070 / 2080
+NVCCFLAGS = -O3 -arch=sm_75 -Xcompiler "/O2 /W3"
+
+# ── Libraries ─────────────────────────────────────────────────────────────
+CUDA_LIBS = "$(CUDA_PATH)\lib\x64\cudart.lib"
+SYS_LIBS  = ws2_32.lib
+
+# ── C source files ────────────────────────────────────────────────────────
+C_SRCS = \
+    layer0\tb_phi_lattice.c \
+    layer1\tb_tensor.c \
+    layer2\tb_graph.c \
+    layer3\tb_orchestration.c \
+    layer4\tb_gguf.c \
+    layer4\tb_tokenizer.c \
+    layer4\tb_infer.c \
+    layer5\tb_semantic_os.c \
+    src\hdgl_bootloaderz.c \
+    src\hdgl_router.c \
+    src\analog_engine.c \
+    src\vector_container.c \
+    src\sha256_minimal.c \
+    src\tb_analog_dispatch.c
+
+# ── CUDA source files ─────────────────────────────────────────────────────
+CUDA_OBJ = $(OBJDIR)\tb_gguf_dequant.obj
+
+# ── Targets ───────────────────────────────────────────────────────────────
+all: dirs addcl $(BINDIR)\tb_infer.exe
+
+dirs:
+    @if not exist $(BINDIR) mkdir $(BINDIR)
+    @if not exist $(OBJDIR) mkdir $(OBJDIR)
+
+# Ensure cl.exe is on PATH (nvcc needs it even for compilation)
+addcl:
+    @set "PATH=$(MSVC_BIN);$(PATH)"
+
+# Compile CUDA dequant kernel to object file
+$(CUDA_OBJ): layer4\tb_gguf_dequant.cu layer4\tb_gguf_dequant.h
+    $(NVCC) $(NVCCFLAGS) -c layer4\tb_gguf_dequant.cu -o $(CUDA_OBJ)
+
+# Compile + link everything into tb_infer.exe
+$(BINDIR)\tb_infer.exe: $(C_SRCS) $(CUDA_OBJ)
+    $(CC) $(CCFLAGS) \
+        $(C_SRCS) \
+        $(CUDA_OBJ) \
+        /Fe:$(BINDIR)\tb_infer.exe \
+        /link $(CUDA_LIBS) $(SYS_LIBS)
+    @echo.
+    @echo ===================================================
+    @echo  Built: $(BINDIR)\tb_infer.exe  (GPU-accelerated)
+    @echo  Run:   bin\tb_infer.exe --benchmark
+    @echo  Serve: bin\tb_infer.exe --model path\to\model.gguf --serve --port 11434
+    @echo ===================================================
+
+# Quick benchmark (synthetic, no model file)
+benchmark: $(BINDIR)\tb_infer.exe
+    $(BINDIR)\tb_infer.exe --benchmark
+
+# Run with Q6_K model
+run-9b: $(BINDIR)\tb_infer.exe
+    $(BINDIR)\tb_infer.exe \
+        --model "$(USERPROFILE)\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q6_K_XL.gguf" \
+        --serve --port 11434
+
+# Run with smallest model
+run-4b: $(BINDIR)\tb_infer.exe
+    $(BINDIR)\tb_infer.exe \
+        --model "$(USERPROFILE)\.ollama\models\blobs\ermiaazarkhalili\qwen3.5-4b-sft-claude-opus-reasoning-unsloth\qwen3.5-4b-sft-claude-opus-reasoning-unsloth.q3_k_m.gguf" \
+        --serve --port 11434
+
+clean:
+    @if exist $(BINDIR)\tb_infer.exe   del $(BINDIR)\tb_infer.exe
+    @if exist $(OBJDIR)\tb_gguf_dequant.obj del $(OBJDIR)\tb_gguf_dequant.obj
+    @echo Cleaned.

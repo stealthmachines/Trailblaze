@@ -1,0 +1,2 @@
+{"event":"benchmark_start","ts_ms":21661824.137,"model":"C:\Users\Owner\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":20}
+{"event":"benchmark_start","ts_ms":22332829.810,"model":"C:\Users\Owner\.ollama\models\blobs\unsloth\Qwen3.5-9B-GGUF\Qwen3.5-9B-UD-Q3_K_XL.gguf","tokens":1}

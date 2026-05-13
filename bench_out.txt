@@ -1,0 +1,28 @@
+=== TRAILBLAZE Inference Runtime ===
+
+[test] Using synthetic model: mixtral layers=4 hidden=512 experts=8
+[tb_dispatch] CPU caps: AVX2=1 AVX512F=0 VNNI=0 FMA=1
+[tb_infer] Context created: hdgl=1 alpha=0.20 lattice={"epoch":20,"n_slots":512,"time":5.2000,"phase_var":0.000833,"consensus":false,"M_U":0.9992,"Lambda_U":12.6531,"S_U":0.8880,"seed":"0x00000000cafebabe"}
+
+[test] HDGL routing: ON (alpha=0.20)
+[routing] token=42 layer=0 → experts=[0(0.533),5(0.467)] hdgl_expert=0 octave=7
+
+[lattice] S(U)=0.8880 Λ=12.6531 M=0.9992
+
+[benchmark] 1 decode calls...
+[benchmark] telemetry log: bench_hdglsql.jsonl
+[benchmark] step 1/1 dt=7.2ms tok=25133
+[benchmark] 1 tokens: 7.5ms -> 132.9 tok/s
+
+[diff] Usage: --diff <dir_a> <dir_b>
+  e.g.: tb_infer --diff /tmp/tb_new/HDGL-SQL-main/HDGL-SQL-main                        /tmp/hdgl_sql_02/HDGL-SQL-0.2
+
+[wuwei] WuWei codec round-trip test...
+[wuwei]   DELTA_FOLD     enc= 64 dec= 64 : PASS
+[wuwei]   PHI_COMPRESS   enc= 68 dec= 64 : PASS
+[wuwei]   SPIRAL_PACK    enc= 64 dec= 64 : PASS
+[wuwei]   RESONANCE      enc= 64 dec= 64 : PASS
+[wuwei]   RAW            enc= 64 dec= 64 : PASS
+[wuwei] ALL PASS
+
+=== TRAILBLAZE Inference Runtime PASS ===

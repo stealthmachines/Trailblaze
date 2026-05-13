@@ -1,0 +1,23 @@
+[tb_cuda] uploaded 212 tensors  4.52 GB to VRAM
+[benchmark] skipping generate self-test
+[tb_infer] KV cache allocated: slot=0 32 layers 4 kv-heads max_seq=4096
+[dbg] step: embedding alloc
+[dbg] emb_t=000001B695BA91C0 qtype=12
+[dbg] emb: qtype=12 bw=256 bb=144 row_stride=2304
+[dbg] emb: dequant done
+[dbg] step: embedding done, entering forward loop NL=32
+[dbg] layer_forward L0: H=4096 NH=16 NK=4 HD=256
+[dbg] L0: allocating xn/ones
+[dbg] L0: find norm_w 'blk.0.attn_norm.weight'
+[dbg] L0: norm_w=000001B695BA9350 qtype=0
+[dbg] L0: malloc w32
+[dbg] L0: get tensor data
+[dbg] L0: convert norm qtype=0
+[dbg] L0: rms_norm
+[dbg] L0: attn_norm done, finding QKV tensors
+[mv] M=12288 K=4096 qtype=11 gpu=Y name=blk.0.ffn_gate.weight
+[mv] -> cuda
+[cmv0] q=11 M=12288 K=4096
+[cmv] launch grd=12288 blk=128 si=0
+[cmv] post-launch ce=0(no error)
+[cmv] waiting sync...

@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command \"Get-Content 'C:\\\\Users\\\\Owner\\\\Documents\\\\trailblazer\\\\v0.7\\\\llm_visible_reply.log' | Select-Object -Last 50\")",
+      "Bash(powershell -Command \"Get-Content 'C:\\\\Users\\\\Owner\\\\Documents\\\\trailblazer\\\\v0.7\\\\bench_hdglsql.jsonl' | Select-Object -Last 20\")",
+      "Bash(cmd /c \"\\\\\"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\\\\\" && nmake -f Makefile.win 2>&1\")",
+      "PowerShell(cd \"C:\\\\Users\\\\Owner\\\\Documents\\\\trailblazer\\\\v0.7\"; $env:PATH = \"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostx64\\\\x64;\" + $env:PATH; cmd /c \"nmake -f Makefile.win 2>&1\")",
+      "PowerShell(cd \"C:\\\\Users\\\\Owner\\\\Documents\\\\trailblazer\\\\v0.7\"; $vcvars = \"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\"; cmd /c \"`\"$vcvars`\" && nmake -f Makefile.win 2>&1\")",
+      "Bash(powershell -Command \"Get-Content 'C:\\\\Users\\\\Owner\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Owner-Documents-trailblazer-v0-7\\\\31f9b236-1ebe-4861-8204-f0ac96de98b1\\\\tasks\\\\blll987tr.output' -Wait | grep --line-buffered -E 'benchmark|step|tok/s|generate|decode|error|FAIL|cuda|ERROR'\")",
+      "Bash(cmd /c \"call \\\\\"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\\\\\" && nmake -f Makefile.win 2>&1\")",
+      "Bash(cmd /c \"\\\\\"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\\\\\" > nul 2>&1 && nmake -f Makefile.win 2>&1\")",
+      "PowerShell(Stop-Process -Force)",
+      "PowerShell(cd \"C:\\\\Users\\\\Owner\\\\Documents\\\\trailblazer\\\\v0.7\"; $vcvars = \"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\"; $output = cmd /c \"\"\"$vcvars\"\" && nmake -f Makefile.win 2>&1\"; $output | Where-Object { $_ -match \"error|Built|fatal\" } | Select-Object -Last 5)",
+      "Bash(nmake -f Makefile.win)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/ggerganov/llama.cpp/master/ggml/src/ggml-cuda/mmvq.cu\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/ggerganov/llama.cpp/master/src/llama-arch.cpp\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/ggerganov/llama.cpp/master/ggml/src/ggml-cuda/vecdotq.cuh\")",
+      "Bash(awk '/case LLM_ARCH_QWEN3:/,/case LLM_ARCH_QWEN3MOE:/')",
+      "Bash(awk '/vec_dot_q3_K_q8_1[^_]/,/^}/')",
+      "Bash(awk '/switch \\\\\\(arch\\\\\\) \\\\{/,/^[[:space:]]*\\\\}/')"
+    ]
+  }
+}

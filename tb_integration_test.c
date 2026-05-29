@@ -30,6 +30,32 @@ static double tb_wall_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+static float tb_v08b_clampf(float x, float lo, float hi) {
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+
+static void tb_v08b_policy_apply(float d_loss_mel,
+                                 float d_loss_1,
+                                 float d_loss_gen,
+                                 float d_loss_disc,
+                                 float disc_real_vol,
+                                 float *out_alpha_scale,
+                                 float *out_semantic_scale,
+                                 float *out_noisy_keep,
+                                 float *out_quality_pressure) {
+    float pressure = 0.0f;
+    if (d_loss_mel > 0.5f) pressure += 0.35f;
+    if (d_loss_1 > 0.4f) pressure += 0.30f;
+    if (disc_real_vol > 0.08f) pressure += 0.20f;
+    if (d_loss_gen < 0.0f && d_loss_disc <= 0.0f && d_loss_mel <= 0.0f) pressure -= 0.15f;
+
+    pressure = tb_v08b_clampf(pressure, -1.0f, 1.0f);
+    if (out_quality_pressure) *out_quality_pressure = pressure;
+    if (out_alpha_scale) *out_alpha_scale = tb_v08b_clampf(1.0f - 0.20f * pressure, 0.65f, 1.15f);
+    if (out_semantic_scale) *out_semantic_scale = tb_v08b_clampf(1.0f - 0.10f * pressure, 0.75f, 1.10f);
+    if (out_noisy_keep) *out_noisy_keep = tb_v08b_clampf(0.85f - 0.25f * pressure, 0.35f, 1.00f);
+}
+
 int main(void) {
     printf("\033[1m=== TRAILBLAZE C Stack — Integration Test ===\033[0m\n");
     double t_start = tb_wall_ms();
@@ -367,6 +393,23 @@ int main(void) {
     for (int p=0; p<5; p++) free(patterns[p]);
     free(query);
     tb_hopfield_free(sem);
+
+    /* ── Layer 4 v0.8b controller policy smoke ─────────────────────────── */
+    SECTION("LAYER 4 (v0.8b Control Policy): Telemetry Coupling");
+
+    float a_hi=0.0f, s_hi=0.0f, n_hi=0.0f, q_hi=0.0f;
+    tb_v08b_policy_apply(1.78f, 1.70f, -0.01f, -0.02f, 0.11f,
+                         &a_hi, &s_hi, &n_hi, &q_hi);
+    assert(q_hi > 0.0f);
+    assert(a_hi < 1.0f && s_hi < 1.0f && n_hi < 0.85f);
+    PASS("Controller tightens routing under degraded mel/L1 + disc volatility");
+
+    float a_ok=0.0f, s_ok=0.0f, n_ok=0.0f, q_ok=0.0f;
+    tb_v08b_policy_apply(-0.20f, -0.10f, -0.05f, -0.03f, 0.01f,
+                         &a_ok, &s_ok, &n_ok, &q_ok);
+    assert(q_ok < 0.0f);
+    assert(a_ok >= 1.0f && s_ok >= 1.0f && n_ok >= 0.85f);
+    PASS("Controller relaxes routing when generator/discriminator/mel all improve");
 
     /* ── Benchmark ───────────────────────────────────────────────────────── */
     SECTION("Benchmark");

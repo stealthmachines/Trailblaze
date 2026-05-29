@@ -1,0 +1,99 @@
+diff --git a/README.md b/README.md
+index v0.7..v0.8b 100644
+--- a/README.md
++++ b/README.md
+@@
+-TRAILBLAZE v0.7 — Qwen3 Inference Runtime + HDGL Phi-Lattice Routing
++TRAILBLAZE v0.8b — Strand-Coupled Co-Learning (Rapid)
++
++v0.8b extends v0.8b-minimal with:
++- HTTP control/state docs
++- Coqui telemetry bridge script
++- Integration smoke tests for control coupling
++- Rapid notes for controller policy
+@@
+ ## HTTP API
+@@
++### POST /api/strand/control
++Inject external training telemetry (loss deltas) so runtime can adapt routing.
++
++### GET /api/strand/state
++Returns controller state and telemetry snapshot.
++
++diff --git a/scripts/bridge_coqui_metrics.py b/scripts/bridge_coqui_metrics.py
++new file mode 100755
++--- /dev/null
+++++ b/scripts/bridge_coqui_metrics.py
++@@
+++#!/usr/bin/env python3
+++"""Read Coqui trainer log lines and POST loss deltas to /api/strand/control."""
+++
+++import argparse
+++import json
+++import re
+++import urllib.request
+++
+++P = re.compile(r"avg_(?P<name>[a-zA-Z0-9_]+):\s*(?P<val>-?\d+(?:\.\d+)?)\s*\((?P<delta>[+-]?\d+(?:\.\d+)?)\)")
+++
+++def parse(path):
+++    txt = open(path, "r", encoding="utf-8", errors="ignore").read()
+++    out = {}
+++    for m in P.finditer(txt):
+++        out[f"avg_{m.group('name')}"] = {
+++            "value": float(m.group("val")),
+++            "delta": float(m.group("delta")),
+++        }
+++    return out
+++
+++def main():
+++    ap = argparse.ArgumentParser()
+++    ap.add_argument("--log", required=True)
+++    ap.add_argument("--url", default="http://127.0.0.1:11434/api/strand/control")
+++    ap.add_argument("--round", type=int, default=0)
+++    args = ap.parse_args()
+++
+++    payload = {"round": args.round, "metrics": parse(args.log)}
+++    req = urllib.request.Request(
+++        args.url,
+++        data=json.dumps(payload).encode("utf-8"),
+++        headers={"Content-Type": "application/json"},
+++        method="POST",
+++    )
+++    with urllib.request.urlopen(req, timeout=30) as r:
+++        print(r.read().decode("utf-8", errors="ignore"))
+++
+++if __name__ == "__main__":
+++    main()
++
++diff --git a/tb_integration_test.c b/tb_integration_test.c
++index v0.7..v0.8b 100644
++--- a/tb_integration_test.c
+++++ b/tb_integration_test.c
++@@
++     PASS("Layer 4 runtime path: PASS");
++
+++    {
+++        float a=0,b=0,c=0,d=0;
+++        tb_ctrl_apply_external_metrics(ctx, 1.8f, 1.7f, -0.01f, -0.02f, 0.11f);
+++        tb_ctrl_export_state(ctx, &a, &b, &c, &d);
+++        assert(a > 0.0f && b > 0.0f && c > 0.0f);
+++    }
+++    PASS("Layer 4 controller coupling: PASS");
++
++diff --git a/docs/v08b_rapid_notes.md b/docs/v08b_rapid_notes.md
++new file mode 100644
++--- /dev/null
+++++ b/docs/v08b_rapid_notes.md
++@@
+++# Trailblaze v0.8b Rapid Notes
+++
+++## Controller policy
+++- if d_loss_mel > +0.5: tighten curation and reduce noisy keep ratio
+++- if d_loss_1 > +0.4: increase clean-anchor ratio
+++- if disc_real volatility > 0.08: suppress analog boost
+++- if d_loss_gen < 0 and d_loss_disc <= 0 and d_loss_mel <= 0: permit more noisy context
+++
+++## Rollout
+++1. Apply v08b-minimal patch first.
+++2. Apply this extended patch second.
+++3. Validate `/api/strand/control` and integration smoke tests.

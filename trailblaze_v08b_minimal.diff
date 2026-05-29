@@ -1,0 +1,197 @@
+diff --git a/layer4/tb_infer.h b/layer4/tb_infer.h
+index v0.7..v0.8b 100644
+--- a/layer4/tb_infer.h
++++ b/layer4/tb_infer.h
+@@
+ typedef struct {
+@@
+     int     tokens_generated, prompt_tokens;
+     uint8_t hdgl_routing_state[32];
++
++    /* v0.8b minimal: telemetry-coupled controller state */
++    float   ctrl_hdgl_alpha_scale;
++    float   ctrl_semantic_boost_scale;
++    float   ctrl_noisy_keep_ratio;
++    float   ctrl_quality_pressure;
++
++    float   telem_last_top1_prob;
++    float   telem_last_inv_conf;
++    float   telem_last_phase_coherence;
++    float   telem_last_route_alpha_eff;
++    uint64_t telem_window_tokens;
+ } TB_InferCtx;
+@@
+ int  tb_serve(TB_ServeConfig *cfg);
++
++void tb_ctrl_apply_external_metrics(TB_InferCtx *ctx,
++                                    float d_loss_mel,
++                                    float d_loss_1,
++                                    float d_loss_gen,
++                                    float d_loss_disc,
++                                    float disc_real_vol);
++void tb_ctrl_export_state(const TB_InferCtx *ctx,
++                          float *out_alpha_scale,
++                          float *out_semantic_scale,
++                          float *out_noisy_keep,
++                          float *out_quality_pressure);
++
++diff --git a/layer4/tb_infer.c b/layer4/tb_infer.c
++index v0.7..v0.8b 100644
++--- a/layer4/tb_infer.c
+++++ b/layer4/tb_infer.c
++@@
++ static float tb_semantic_boost(int octave, int expert_idx, int n_experts) {
++@@
++ }
++
+++static float tb_clampf(float x, float lo, float hi) {
+++    return x < lo ? lo : (x > hi ? hi : x);
+++}
+++
+++void tb_ctrl_apply_external_metrics(TB_InferCtx *ctx,
+++                                    float d_loss_mel,
+++                                    float d_loss_1,
+++                                    float d_loss_gen,
+++                                    float d_loss_disc,
+++                                    float disc_real_vol) {
+++    if (!ctx) return;
+++
+++    float pressure = 0.0f;
+++    if (d_loss_mel > 0.5f) pressure += 0.35f;
+++    if (d_loss_1 > 0.4f) pressure += 0.30f;
+++    if (disc_real_vol > 0.08f) pressure += 0.20f;
+++    if (d_loss_gen < 0.0f && d_loss_disc <= 0.0f && d_loss_mel <= 0.0f) pressure -= 0.15f;
+++
+++    ctx->ctrl_quality_pressure = tb_clampf(pressure, -1.0f, 1.0f);
+++    ctx->ctrl_hdgl_alpha_scale     = tb_clampf(1.0f - 0.20f * ctx->ctrl_quality_pressure, 0.65f, 1.15f);
+++    ctx->ctrl_semantic_boost_scale = tb_clampf(1.0f - 0.10f * ctx->ctrl_quality_pressure, 0.75f, 1.10f);
+++    ctx->ctrl_noisy_keep_ratio     = tb_clampf(0.85f - 0.25f * ctx->ctrl_quality_pressure, 0.35f, 1.00f);
+++}
+++
+++void tb_ctrl_export_state(const TB_InferCtx *ctx,
+++                          float *out_alpha_scale,
+++                          float *out_semantic_scale,
+++                          float *out_noisy_keep,
+++                          float *out_quality_pressure) {
+++    if (!ctx) return;
+++    if (out_alpha_scale) *out_alpha_scale = ctx->ctrl_hdgl_alpha_scale;
+++    if (out_semantic_scale) *out_semantic_scale = ctx->ctrl_semantic_boost_scale;
+++    if (out_noisy_keep) *out_noisy_keep = ctx->ctrl_noisy_keep_ratio;
+++    if (out_quality_pressure) *out_quality_pressure = ctx->ctrl_quality_pressure;
+++}
++
++@@
++ TB_ExpertSelection tb_route_experts(
++@@
++-    sel.hdgl_alpha = ctx->hdgl_alpha;
+++    float alpha_eff = ctx->hdgl_alpha * tb_clampf(ctx->ctrl_hdgl_alpha_scale, 0.65f, 1.15f);
+++    sel.hdgl_alpha = alpha_eff;
++@@
++-            float _eff_alpha = ctx->hdgl_alpha * _alpha_mod;
+++            float _eff_alpha = alpha_eff * _alpha_mod;
++@@
++-                scores[e] *= tb_semantic_boost(octave, e, n_experts);
+++                scores[e] *= tb_semantic_boost(octave, e, n_experts)
+++                             * tb_clampf(ctx->ctrl_semantic_boost_scale, 0.75f, 1.10f);
++         }
++     }
++
+++    ctx->telem_last_route_alpha_eff = alpha_eff;
+++    ctx->telem_last_phase_coherence = ctx->lattice ? (float)tb_phase_coherence(ctx->lattice) : 0.0f;
+++    ctx->telem_window_tokens += 1;
++
++@@
++ TB_InferCtx* tb_infer_create(...)
++@@
++     ctx->temperature = 0.7f;
++     ctx->top_p = 0.9f;
++     ctx->top_k = 40;
++
+++    ctx->ctrl_hdgl_alpha_scale = 1.0f;
+++    ctx->ctrl_semantic_boost_scale = 1.0f;
+++    ctx->ctrl_noisy_keep_ratio = 0.85f;
+++    ctx->ctrl_quality_pressure = 0.0f;
+++    ctx->telem_window_tokens = 0;
++
++diff --git a/src/tb_strand_control.h b/src/tb_strand_control.h
++new file mode 100644
++--- /dev/null
+++++ b/src/tb_strand_control.h
++@@
+++#pragma once
+++
+++typedef struct {
+++    int   round;
+++    float d_loss_mel;
+++    float d_loss_1;
+++    float d_loss_gen;
+++    float d_loss_disc;
+++    float d_disc_real_vol;
+++} TB_ExternalMetrics;
+++
+++int tb_parse_control_json(const char *json, TB_ExternalMetrics *out);
++
++diff --git a/src/tb_strand_control.c b/src/tb_strand_control.c
++new file mode 100644
++--- /dev/null
+++++ b/src/tb_strand_control.c
++@@
+++#include "tb_strand_control.h"
+++#include <stdio.h>
+++#include <string.h>
+++
+++int tb_parse_control_json(const char *json, TB_ExternalMetrics *out) {
+++    if (!json || !out) return -1;
+++    memset(out, 0, sizeof(*out));
+++
+++    const char *p;
+++    if ((p = strstr(json, "\"round\"")))        sscanf(p, "\"round\"%*[^0-9-]%d", &out->round);
+++    if ((p = strstr(json, "avg_loss_mel")))      sscanf(p, "%*[^+-0-9]%f", &out->d_loss_mel);
+++    if ((p = strstr(json, "avg_loss_1")))        sscanf(p, "%*[^+-0-9]%f", &out->d_loss_1);
+++    if ((p = strstr(json, "avg_loss_gen")))      sscanf(p, "%*[^+-0-9]%f", &out->d_loss_gen);
+++    if ((p = strstr(json, "avg_loss_disc\"")))   sscanf(p, "%*[^+-0-9]%f", &out->d_loss_disc);
+++    if ((p = strstr(json, "disc_real_vol")))      sscanf(p, "%*[^+-0-9]%f", &out->d_disc_real_vol);
+++
+++    return 0;
+++}
++
++diff --git a/src/zchg_http.c b/src/zchg_http.c
++index v0.7..v0.8b 100644
++--- a/src/zchg_http.c
+++++ b/src/zchg_http.c
++@@
+++#include "tb_strand_control.h"
++@@
++ static int zchg_http_handle_post(...)
++@@
+++    if (strcmp(path, "/api/strand/control") == 0) {
+++        TB_ExternalMetrics m;
+++        if (tb_parse_control_json(body, &m) == 0) {
+++            extern TB_InferCtx *g_tb_active_ctx;
+++            if (g_tb_active_ctx) {
+++                tb_ctrl_apply_external_metrics(g_tb_active_ctx,
+++                    m.d_loss_mel, m.d_loss_1, m.d_loss_gen, m.d_loss_disc, m.d_disc_real_vol);
+++            }
+++            return zchg_http_reply_json(conn,
+++                "{\"status\":\"ok\",\"updated\":true}", 200);
+++        }
+++        return zchg_http_reply_json(conn,
+++            "{\"status\":\"error\",\"message\":\"invalid control payload\"}", 400);
+++    }
++
++diff --git a/Makefile b/Makefile
++index v0.7..v0.8b 100644
++--- a/Makefile
+++++ b/Makefile
++@@
++ SRC += src/hdgl_router.c
++ SRC += src/hdgl_critic.c
+++SRC += src/tb_strand_control.c
++
++diff --git a/Makefile.win b/Makefile.win
++index v0.7..v0.8b 100644
++--- a/Makefile.win
+++++ b/Makefile.win
++@@
++ SRCS= ... src\hdgl_router.c src\hdgl_critic.c ...
+++SRCS= ... src\hdgl_router.c src\hdgl_critic.c src\tb_strand_control.c ...

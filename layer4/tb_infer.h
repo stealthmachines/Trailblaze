@@ -72,6 +72,17 @@ typedef struct {
     int     tokens_generated, prompt_tokens;
     /* HDGL_History (28 bytes) — per-context Spiral8 phase state  */
     uint8_t hdgl_routing_state[32];
+    /* v0.8b minimal: telemetry-coupled controller state */
+    float   ctrl_hdgl_alpha_scale;
+    float   ctrl_semantic_boost_scale;
+    float   ctrl_noisy_keep_ratio;
+    float   ctrl_quality_pressure;
+    /* Rolling telemetry snapshot */
+    float   telem_last_top1_prob;
+    float   telem_last_inv_conf;
+    float   telem_last_phase_coherence;
+    float   telem_last_route_alpha_eff;
+    uint64_t telem_window_tokens;
     /* Layer 3: Cognition tree (wired in tb_infer_create/free) */
     TB_CognitionTree *tree;
     /* Serialise generate calls: prevents data races on lattice/ctx state */
@@ -115,6 +126,19 @@ int  tb_infer_generate(TB_InferCtx *ctx, const int *prompt_ids, int n_prompt,
                         int *out_ids, int max_out, int session_id,
                         void (*token_cb)(int,void*), void *cb_ud);
 int  tb_serve         (TB_ServeConfig *cfg);
+
+/* v0.8b minimal: external telemetry control hooks */
+void tb_ctrl_apply_external_metrics(TB_InferCtx *ctx,
+                                    float d_loss_mel,
+                                    float d_loss_1,
+                                    float d_loss_gen,
+                                    float d_loss_disc,
+                                    float disc_real_vol);
+void tb_ctrl_export_state(const TB_InferCtx *ctx,
+                          float *out_alpha_scale,
+                          float *out_semantic_scale,
+                          float *out_noisy_keep,
+                          float *out_quality_pressure);
 
 /* Expert routing (HDGL phi-lattice blend) */
 TB_ExpertSelection tb_route_experts(TB_InferCtx *ctx, int token_id,

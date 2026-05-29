@@ -236,6 +236,42 @@ static float tb_semantic_boost(int octave, int expert_idx, int n_experts) {
     return 1.0f + local_gain * cosf((phi_exp - octave_f) * (float)M_PI * 2.0f) * 0.5f;
 }
 
+static float tb_clampf(float x, float lo, float hi) {
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+
+void tb_ctrl_apply_external_metrics(TB_InferCtx *ctx,
+                                    float d_loss_mel,
+                                    float d_loss_1,
+                                    float d_loss_gen,
+                                    float d_loss_disc,
+                                    float disc_real_vol) {
+    if (!ctx) return;
+
+    float pressure = 0.0f;
+    if (d_loss_mel > 0.5f) pressure += 0.35f;
+    if (d_loss_1 > 0.4f) pressure += 0.30f;
+    if (disc_real_vol > 0.08f) pressure += 0.20f;
+    if (d_loss_gen < 0.0f && d_loss_disc <= 0.0f && d_loss_mel <= 0.0f) pressure -= 0.15f;
+
+    ctx->ctrl_quality_pressure = tb_clampf(pressure, -1.0f, 1.0f);
+    ctx->ctrl_hdgl_alpha_scale     = tb_clampf(1.0f - 0.20f * ctx->ctrl_quality_pressure, 0.65f, 1.15f);
+    ctx->ctrl_semantic_boost_scale = tb_clampf(1.0f - 0.10f * ctx->ctrl_quality_pressure, 0.75f, 1.10f);
+    ctx->ctrl_noisy_keep_ratio     = tb_clampf(0.85f - 0.25f * ctx->ctrl_quality_pressure, 0.35f, 1.00f);
+}
+
+void tb_ctrl_export_state(const TB_InferCtx *ctx,
+                          float *out_alpha_scale,
+                          float *out_semantic_scale,
+                          float *out_noisy_keep,
+                          float *out_quality_pressure) {
+    if (!ctx) return;
+    if (out_alpha_scale) *out_alpha_scale = ctx->ctrl_hdgl_alpha_scale;
+    if (out_semantic_scale) *out_semantic_scale = ctx->ctrl_semantic_boost_scale;
+    if (out_noisy_keep) *out_noisy_keep = ctx->ctrl_noisy_keep_ratio;
+    if (out_quality_pressure) *out_quality_pressure = ctx->ctrl_quality_pressure;
+}
+
 TB_ExpertSelection tb_route_experts(
     TB_InferCtx   *ctx,
     int            token_id,
@@ -246,8 +282,9 @@ TB_ExpertSelection tb_route_experts(
     TB_ExpertSelection sel = {0};
     int k = ctx->model->n_experts_per_tok;
     if (k > 8) k = 8;
-    sel.k          = k;
-    sel.hdgl_alpha = ctx->hdgl_alpha;
+    sel.k = k;
+    float alpha_eff = ctx->hdgl_alpha * tb_clampf(ctx->ctrl_hdgl_alpha_scale, 0.65f, 1.15f);
+    sel.hdgl_alpha = alpha_eff;
 
     /* Copy gate scores */
     float scores[256];
@@ -295,6 +332,8 @@ TB_ExpertSelection tb_route_experts(
         float _raw_sum = 0.0f;
         for (int _e = 0; _e < n_experts; _e++) _raw_sum += expf(scores[_e] - _top1_raw);
         float _top1_prob = 1.0f / _raw_sum;   /* top1_prob = exp(0) / sum */
+        ctx->telem_last_top1_prob = _top1_prob;
+        ctx->telem_last_inv_conf = 1.0f - _top1_prob;
 
         float _crit_feat[CRITIC_IN];
         _crit_feat[0] = 1.0f - _top1_prob;                           /* inv_conf   */
@@ -311,7 +350,7 @@ TB_ExpertSelection tb_route_experts(
                         : 0.0f;                                       /* accum_norm */
 
         float _alpha_mod = critic_alpha_mod(_crit_feat);  /* [0.3, 1.0] */
-        float _eff_alpha = ctx->hdgl_alpha * _alpha_mod;
+        float _eff_alpha = alpha_eff * _alpha_mod;
 
         if (hdgl_exp >= 0 && hdgl_exp < n_experts) {
             /* Primary boost scaled by learned alpha modulator */
@@ -344,8 +383,13 @@ TB_ExpertSelection tb_route_experts(
             int octave = tb_semantic_octave(token_id, layer_idx);
             sel.semantic_octave = octave;
             for (int e = 0; e < n_experts; e++)
-                scores[e] *= tb_semantic_boost(octave, e, n_experts);
+                scores[e] *= tb_semantic_boost(octave, e, n_experts)
+                             * tb_clampf(ctx->ctrl_semantic_boost_scale, 0.75f, 1.10f);
         }
+
+        ctx->telem_last_route_alpha_eff = alpha_eff;
+        ctx->telem_last_phase_coherence = ctx->lattice ? (1.0f - (float)ctx->lattice->phase_var) : 0.0f;
+        ctx->telem_window_tokens += 1;
     }
 
     /* Softmax */
@@ -432,6 +476,11 @@ TB_InferCtx* tb_infer_create(TB_GGUFModel *model,
     ctx->temperature       = 0.7f;
     ctx->top_p             = 0.9f;
     ctx->top_k             = 40;
+    ctx->ctrl_hdgl_alpha_scale = 1.0f;
+    ctx->ctrl_semantic_boost_scale = 1.0f;
+    ctx->ctrl_noisy_keep_ratio = 0.85f;
+    ctx->ctrl_quality_pressure = 0.0f;
+    ctx->telem_window_tokens = 0;
 
     /* Create phi-lattice */
     if (lattice_slots == 0) lattice_slots = 512;
@@ -1239,6 +1288,20 @@ static int tb_json_extract_bool(const char *json, const char *key) {
     return (strncmp(p, "true", 4) == 0);
 }
 
+/* Extract float from simple JSON numeric field. Returns fallback if missing. */
+static float tb_json_extract_float(const char *json, const char *key, float fallback) {
+    if (!json || !key) return fallback;
+    char keybuf[128];
+    snprintf(keybuf, sizeof(keybuf), "\"%s\"", key);
+    const char *p = strstr(json, keybuf);
+    if (!p) return fallback;
+    p = strchr(p + strlen(keybuf), ':');
+    if (!p) return fallback;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return strtof(p, NULL);
+}
+
 /* Streaming callback: one call per generated token. */
 typedef struct {
     tb_socket_t  fd;
@@ -1315,6 +1378,26 @@ static void* tb_handle_conn(void *arg) {
             ctx->model->arch,
             ctx->model->n_layers * ctx->model->hidden_dim / 1000000);
         tb_http_response(fd, 200, "application/json", rbody);
+
+    } else if (strcmp(path, "/api/strand/state") == 0 && strcmp(method, "GET") == 0) {
+        float a = 0.0f, s = 0.0f, n = 0.0f, q = 0.0f;
+        tb_ctrl_export_state(ctx, &a, &s, &n, &q);
+        char rbody[512];
+        snprintf(rbody, sizeof(rbody),
+            "{\"status\":\"ok\",\"controller\":{\"hdgl_alpha_scale\":%.4f,"
+            "\"semantic_boost_scale\":%.4f,\"noisy_keep_ratio\":%.4f,"
+            "\"quality_pressure\":%.4f,\"tokens\":%llu}}",
+            a, s, n, q, (unsigned long long)ctx->telem_window_tokens);
+        tb_http_response(fd, 200, "application/json", rbody);
+
+    } else if (strcmp(path, "/api/strand/control") == 0 && strcmp(method, "POST") == 0) {
+        float d_loss_mel  = tb_json_extract_float(body, "avg_loss_mel", 0.0f);
+        float d_loss_1    = tb_json_extract_float(body, "avg_loss_1", 0.0f);
+        float d_loss_gen  = tb_json_extract_float(body, "avg_loss_gen", 0.0f);
+        float d_loss_disc = tb_json_extract_float(body, "avg_loss_disc", 0.0f);
+        float d_disc_vol  = tb_json_extract_float(body, "disc_real_vol", 0.0f);
+        tb_ctrl_apply_external_metrics(ctx, d_loss_mel, d_loss_1, d_loss_gen, d_loss_disc, d_disc_vol);
+        tb_http_response(fd, 200, "application/json", "{\"status\":\"ok\",\"updated\":true}");
 
     } else if ((strcmp(path, "/api/generate") == 0 || strcmp(path, "/api/chat") == 0)
                && strcmp(method, "POST") == 0) {

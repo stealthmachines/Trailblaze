@@ -1,11 +1,12 @@
-# TRAILBLAZE v0.7 — Qwen3 Inference Runtime + HDGL Phi-Lattice Routing
+# TRAILBLAZE v0.8b — Qwen3 Inference Runtime + HDGL Phi-Lattice Routing
 
 CPU-native (with optional CUDA) inference runtime for Qwen3.x GGUF models.
 Runs the full transformer forward pass in portable C11.  No Python, no Docker.
 Exposes an Ollama-compatible HTTP API so existing tools (Open WebUI, LangChain,
 Continue, etc.) work unchanged.
 
-**v0.7 highlights:** HDGL phi-lattice expert routing validated on RTX 2060 (3.0 tok/s),
+**v0.8b highlights:** telemetry-coupled HDGL control endpoints (`/api/strand/control`,
+`/api/strand/state`) in addition to v0.7 features: HDGL phi-lattice expert routing validated on RTX 2060 (3.0 tok/s),
 WuWei compression codec (5 strategies), analog dispatch with CUDA 4-stream async,
 multi-session KV persistence, full Qwen3.5 & Qwen3.6 support.
 
@@ -171,6 +172,28 @@ curl http://localhost:11434/api/tags
 ```bash
 curl http://localhost:11434/health
 # {"status":"ok","runtime":"trailblaze"}
+```
+
+### Strand control (v0.8b)
+
+Inject external telemetry deltas to modulate HDGL routing controller state:
+
+```bash
+curl http://localhost:11434/api/strand/control \
+  -H "Content-Type: application/json" \
+  -d '{
+    "avg_loss_mel": 1.78,
+    "avg_loss_1": 1.70,
+    "avg_loss_gen": -0.01,
+    "avg_loss_disc": -0.02,
+    "disc_real_vol": 0.11
+  }'
+```
+
+Read current controller state:
+
+```bash
+curl http://localhost:11434/api/strand/state
 ```
 
 ## Using with Open WebUI

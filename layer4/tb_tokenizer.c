@@ -215,11 +215,34 @@ typedef struct TB_BPESymbol {
 #define BPE_SYM_MAX 256
 #define BPE_MAX_SYM 8192
 
-/* GPT-2 byte-to-unicode: bytes 0-255 → printable unicode codepoints */
+/* GPT-2 byte-to-unicode: bytes 0-255 → printable unicode codepoints.
+ *
+ * The reference Python is:
+ *   bs  = list(range(ord('!'), ord('~')+1))          # 0x21–0x7E  (94 bytes)
+ *         + list(range(ord('¡'), ord('¬')+1))         # 0xA1–0xAC  (12 bytes)
+ *         + list(range(ord('®'), 256))                # 0xAE–0xFF  (82 bytes)
+ *   cs  = bs[:]
+ *   n   = 0
+ *   for b in range(2**8):
+ *       if b not in bs:
+ *           bs.append(b); cs.append(2**8 + n); n += 1
+ *
+ * That yields 256 non-printable bytes mapped to codepoints 256–288.
+ * Space (0x20) is NOT in the printable range above, so it ends up mapped
+ * to some codepoint ≥ 256, which then reverse-maps to 0 (null) in u2b[],
+ * silently deleting every space in decoded output.
+ *
+ * The fix: extend the lower printable bound from 0x21 to 0x20 so that
+ * space maps to itself (codepoint 32), exactly matching the GPT-2
+ * tokenizer's actual vocab where b'\x20' encodes as the literal space
+ * character U+0020.
+ */
 static void tb_byte_to_unicode(uint32_t out[256]) {
     int n = 0;
     for (int b = 0; b < 256; b++) {
-        if ((b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF))
+        /* 0x20–0x7E: printable ASCII including space
+         * 0xA1–0xAC, 0xAE–0xFF: Latin-1 supplement printable range */
+        if ((b >= 0x20 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF))
             out[b] = (uint32_t)b;
         else
             out[b] = 256 + n++;
@@ -245,12 +268,42 @@ int tb_tokenizer_encode(const TB_Tokenizer *tok,
     uint32_t b2u[256];
     tb_byte_to_unicode(b2u);
 
+    /* Pre-resolve byte fallback IDs so unknown pieces do not collapse to token 0. */
+    int byte_ids[256];
+    for (int b = 0; b < 256; b++) {
+        char bs[8];
+        int blen = tb_encode_utf8(b2u[b], bs);
+        bs[blen] = '\0';
+        int id = tb_tokenizer_token_to_id(tok, bs);
+        if (id < 0 && b >= 0x20 && b <= 0x7E) {
+            char raw[2] = {(char)b, '\0'};
+            id = tb_tokenizer_token_to_id(tok, raw);
+        }
+        byte_ids[b] = id;
+    }
+    int unk_id = tb_tokenizer_token_to_id(tok, "<unk>");
+
+    /* Detect word-start marker style used by the vocab (SentencePiece or GPT-2 style). */
+    const char *word_marker = NULL;
+    int word_marker_len = 0;
+    int word_marker_id = tb_tokenizer_token_to_id(tok, "\xe2\x96\x81"); /* ▁ */
+    if (word_marker_id >= 0) {
+        word_marker = "\xe2\x96\x81";
+        word_marker_len = 3;
+    } else {
+        word_marker_id = tb_tokenizer_token_to_id(tok, "\xC4\xA0"); /* Ġ */
+        if (word_marker_id >= 0) {
+            word_marker = "\xC4\xA0";
+            word_marker_len = 2;
+        }
+    }
+
     /* Convert input bytes to BPE Unicode representation */
     TB_BPESymbol *syms = (TB_BPESymbol*)malloc(BPE_MAX_SYM * sizeof(TB_BPESymbol));
     if (!syms) return n_out;
     int n_syms = 0;
 
-    /* Space-prefix: add '▁' (U+2581) before each word-initial character */
+    /* Optional word-prefix marker for vocabularies that use one (▁ / Ġ). */
     const char *p = text;
     int at_word_start = 1;
     while (*p && n_syms < BPE_MAX_SYM - 1) {
@@ -259,10 +312,11 @@ int tb_tokenizer_encode(const TB_Tokenizer *tok,
         s->prev = n_syms - 1;
         s->next = n_syms + 1;
 
-        if (at_word_start && byte != ' ') {
-            /* prepend '▁' (UTF-8: E2 96 81) */
-            char sym_str[8] = "\xe2\x96\x81";
-            int slen = 3;
+        if (at_word_start && byte != ' ' && word_marker) {
+            /* Prepend detected word-start marker when supported by vocab. */
+            char sym_str[8] = {0};
+            memcpy(sym_str, word_marker, (size_t)word_marker_len);
+            int slen = word_marker_len;
             /* Append GPT-2 unicode for byte */
             uint32_t cp = b2u[byte];
             slen += tb_encode_utf8(cp, sym_str + slen);
@@ -270,11 +324,11 @@ int tb_tokenizer_encode(const TB_Tokenizer *tok,
             sym_str[slen] = '\0';
             s->id = tb_tokenizer_token_to_id(tok, sym_str);
             if (s->id < 0) {
-                /* Split: '▁' as separate symbol */
-                strncpy(s->text, "\xe2\x96\x81", BPE_SYM_MAX-1);
-                s->len = 3;
-                s->id  = tb_tokenizer_token_to_id(tok, "\xe2\x96\x81");
-                if (s->id < 0) s->id = 0;
+                /* Split marker + byte symbol if merged form is absent. */
+                strncpy(s->text, word_marker, BPE_SYM_MAX-1);
+                s->text[BPE_SYM_MAX-1] = '\0';
+                s->len = word_marker_len;
+                s->id  = word_marker_id;
                 n_syms++;
                 /* Then the actual byte */
                 s = &syms[n_syms];
@@ -283,15 +337,25 @@ int tb_tokenizer_encode(const TB_Tokenizer *tok,
             int plen = tb_encode_utf8(cp, s->text);
             s->text[plen] = '\0'; s->len = plen;
             s->id = tb_tokenizer_token_to_id(tok, s->text);
-            if (s->id < 0) s->id = (int)b2u[byte] % tok->vocab_size;
+            if (s->id < 0) s->id = byte_ids[byte];
+            if (s->id < 0) s->id = unk_id;
             n_syms++;
             at_word_start = 0;
         } else {
+            /* Bug 3 fix: in ▁/Ġ-marker vocabs, a space byte is a pure word-boundary
+             * signal — plain " " is not a token in these vocabularies.  Emitting it
+             * as a symbol produces id=-1 → <unk>, corrupting every inter-word boundary.
+             * Consume the byte, set at_word_start, and emit no symbol. */
+            if (byte == ' ' && word_marker) {
+                at_word_start = 1;
+                continue;
+            }
             uint32_t cp = b2u[byte];
             int plen = tb_encode_utf8(cp, s->text);
             s->text[plen] = '\0'; s->len = plen;
             s->id = tb_tokenizer_token_to_id(tok, s->text);
-            if (s->id < 0) s->id = (int)cp % tok->vocab_size;
+            if (s->id < 0) s->id = byte_ids[byte];
+            if (s->id < 0) s->id = unk_id;
             n_syms++;
             at_word_start = (byte == ' ');
         }
@@ -305,7 +369,7 @@ int tb_tokenizer_encode(const TB_Tokenizer *tok,
         changed = 0;
         int best_prio = INT_MAX, best_i = -1;
         for (int i = 0; i < n_syms; i++) {
-            if (syms[i].next < 0 || syms[i].next >= n_syms) continue;
+            if (syms[i].len <= 0 || syms[i].next < 0 || syms[i].next >= n_syms) continue;
             /* Concatenate sym[i] + sym[next] */
             int ni = syms[i].next;
             char combined[BPE_SYM_MAX * 2];
@@ -329,18 +393,27 @@ int tb_tokenizer_encode(const TB_Tokenizer *tok,
             int ni = syms[best_i].next;
             /* Merge best_i and ni into best_i */
             int cl = syms[best_i].len + syms[ni].len;
-            if (cl < BPE_SYM_MAX) {
+            if (cl >= BPE_SYM_MAX) {
+                /* Bug 5 fix: merged form overflows the symbol text buffer.
+                 * Previously the code skipped the text update but still removed
+                 * ni from the linked list, silently dropping its content and
+                 * corrupting subsequent merges.
+                 * Correct fix: mark ni as unmergeable this round (len=-1 sentinel,
+                 * skipped by the inner loop's next check) and leave it in place
+                 * so both symbols reach the collect phase independently. */
+                syms[ni].len = -1;
+                changed = 1;
+            } else {
                 memcpy(syms[best_i].text + syms[best_i].len, syms[ni].text, syms[ni].len);
                 syms[best_i].text[cl] = '\0';
                 syms[best_i].len = cl;
                 syms[best_i].id = tb_tokenizer_token_to_id(tok, syms[best_i].text);
-                if (syms[best_i].id < 0) syms[best_i].id = 0;
+                /* Remove ni from list */
+                syms[best_i].next = syms[ni].next;
+                if (syms[ni].next >= 0) syms[syms[ni].next].prev = best_i;
+                syms[ni].len = 0;  /* mark as removed */
+                changed = 1;
             }
-            /* Remove ni from list */
-            syms[best_i].next = syms[ni].next;
-            if (syms[ni].next >= 0) syms[syms[ni].next].prev = best_i;
-            syms[ni].len = 0;  /* mark as removed */
-            changed = 1;
         }
     }
 
@@ -357,47 +430,92 @@ int tb_tokenizer_encode(const TB_Tokenizer *tok,
 char* tb_tokenizer_decode(const TB_Tokenizer *tok, const int *ids, int n_ids) {
     if (!tok || !ids || n_ids <= 0) return strdup("");
 
-    /* Estimate buffer size */
-    size_t cap = (size_t)n_ids * 8 + 16;
+    /* Concatenate token pieces as UTF-8; avoid GPT-2 byte remap that causes mojibake. */
+    size_t cap = (size_t)n_ids * 12 + 32;
     char *out = (char*)malloc(cap);
     if (!out) return NULL;
     size_t pos = 0;
 
-    uint32_t b2u[256]; tb_byte_to_unicode(b2u);
-    /* Build reverse: unicode → byte */
+    uint32_t b2u[256];
     uint8_t u2b[512] = {0};
-    for (int b = 0; b < 256; b++) { if (b2u[b] < 512) u2b[b2u[b]] = (uint8_t)b; }
+    tb_byte_to_unicode(b2u);
+    for (int b = 0; b < 256; b++) {
+        if (b2u[b] < 512) u2b[b2u[b]] = (uint8_t)b;
+    }
 
     for (int i = 0; i < n_ids; i++) {
         int id = ids[i];
         if (id < 0 || id >= tok->vocab_size) continue;
-        const char *s = tok->vocab[id];
-        if (!s) continue;
+        const char *sp = tok->vocab[id];
+        if (!sp || !sp[0]) continue;
 
-        /* Handle '▁' → space */
-        const char *sp = s;
-        if (strncmp(sp, "\xe2\x96\x81", 3) == 0) {
-            if (pos > 0) { /* add space before word */
-                if (pos + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+        /* SentencePiece / GPT-2 style word-prefix markers -> space before token. */
+        if ((unsigned char)sp[0] == 0xE2 && (unsigned char)sp[1] == 0x96 && (unsigned char)sp[2] == 0x81) {
+            if (pos > 0) {
+                if (pos + 2 >= cap) { cap *= 2; out = (char*)realloc(out, cap); if (!out) return NULL; }
                 out[pos++] = ' ';
             }
             sp += 3;
+        } else if ((unsigned char)sp[0] == 0xC4 && (unsigned char)sp[1] == 0xA0) {
+            if (pos > 0) {
+                if (pos + 2 >= cap) { cap *= 2; out = (char*)realloc(out, cap); if (!out) return NULL; }
+                out[pos++] = ' ';
+            }
+            sp += 2;
         }
 
-        /* Decode GPT-2 unicode bytes */
-        while (*sp) {
-            unsigned char byte = (unsigned char)*sp;
-            uint32_t cp;
-            int bytes;
-            if (byte < 0x80)       { cp = byte; bytes = 1; }
-            else if (byte < 0xE0)  { cp = ((byte&0x1F)<<6)|((unsigned char)sp[1]&0x3F); bytes = 2; }
-            else                   { cp = ((byte&0x0F)<<12)|((unsigned char)sp[1]&0x3F)<<6|((unsigned char)sp[2]&0x3F); bytes = 3; }
-            sp += bytes;
-            uint8_t raw = (cp < 512) ? u2b[cp] : (uint8_t)'?';
-            if (pos + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
-            out[pos++] = (char)raw;
+        {
+            /* token_type: 1=normal 2=byte 3=control.
+             * Only type-2 (byte) tokens use the GPT-2 byte→unicode encoding in
+             * their vocab string and need the reverse mapping.  Applying it to
+             * type-1 tokens corrupts accented Latin (ü→0xFC) and maps the space
+             * character (cp=32) to a null byte (u2b[32]=0). */
+            int ttype = tok->token_type ? tok->token_type[id] : 1;
+
+            if (ttype != 2) {
+                /* Normal/control token: vocab string is already valid UTF-8. */
+                size_t slen = strlen(sp);
+                if (slen == 0) continue;
+                if (pos + slen + 1 >= cap) {
+                    while (pos + slen + 1 >= cap) cap *= 2;
+                    out = (char*)realloc(out, cap);
+                    if (!out) return NULL;
+                }
+                memcpy(out + pos, sp, slen);
+                pos += slen;
+            } else {
+                /* Byte token: reverse the GPT-2 byte→unicode mapping. */
+                while (*sp) {
+                    unsigned char c0 = (unsigned char)sp[0];
+                    uint32_t cp;
+                    int n;
+                    if (c0 < 0x80) {
+                        cp = c0; n = 1;
+                    } else if ((c0 & 0xE0) == 0xC0 && sp[1]) {
+                        cp = ((uint32_t)(c0 & 0x1F) << 6) | ((uint32_t)(sp[1] & 0x3F));
+                        n = 2;
+                    } else if ((c0 & 0xF0) == 0xE0 && sp[1] && sp[2]) {
+                        cp = ((uint32_t)(c0 & 0x0F) << 12)
+                           | ((uint32_t)(sp[1] & 0x3F) << 6)
+                           | ((uint32_t)(sp[2] & 0x3F));
+                        n = 3;
+                    } else {
+                        cp = c0; n = 1;
+                    }
+                    sp += n;
+                    if (cp < 512) {
+                        if (pos + 2 >= cap) {
+                            cap *= 2;
+                            out = (char*)realloc(out, cap);
+                            if (!out) return NULL;
+                        }
+                        out[pos++] = (char)u2b[cp];
+                    }
+                }
+            }
         }
     }
+
     out[pos] = '\0';
     return out;
 }

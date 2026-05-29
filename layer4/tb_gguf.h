@@ -51,8 +51,17 @@ typedef struct {
     int   hidden_dim, ffn_dim, moe_intermediate_size;
     int   n_experts, n_experts_per_tok, group_size;
     float rope_base, norm_eps;
+    int   rope_rotary_dim;  /* partial RoPE: only rotate first rope_rotary_dim dims.
+                             * 0 or head_dim means full rotation (default).
+                             * Set from rope.dimension_count GGUF key. */
     int   max_seq_len, full_attn_interval;
     int   bos_token_id, eos_token_id;
+    /* Qwen3.5 hybrid SSM parameters */
+    int   ssm_state_size;     /* d_state / head_d_k (128) */
+    int   ssm_inner_size;     /* value dim = n_groups * head_d_v (4096) */
+    int   ssm_conv_kernel;    /* conv kernel size (4) */
+    int   ssm_group_count;    /* n_groups / n_heads (16) */
+    int   ssm_time_step_rank; /* alpha/beta output dim (32) */
 
     /* Tensors */
     TB_GGUFTensorInfo *tensors;
@@ -67,6 +76,11 @@ typedef struct {
 
     /* Tokenizer (extracted from GGUF KV) */
     TB_Tokenizer *tokenizer;  /* NULL if vocab not in GGUF */
+
+    /* Chat template string from tokenizer.chat_template GGUF key.
+     * NULL when the model does not embed a template.
+     * Heap-allocated; freed by tb_gguf_free(). */
+    char *chat_template;
 
     /* mmap */
     void  *weights_data;

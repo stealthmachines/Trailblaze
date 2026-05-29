@@ -111,8 +111,12 @@ static inline int tb_mkdir(const char *path, int mode)
 #endif
 
 /* struct timespec is defined in <time.h> under MSVC (VS2015+) — no redef  */
+#ifdef _MSC_VER
 typedef int clockid_t;
+#endif
 
+/* MinGW (MSYS2) provides clock_gettime via winpthread; only define our shim for MSVC */
+#if defined(_MSC_VER) && !defined(HAVE_CLOCK_GETTIME)
 static inline int clock_gettime(clockid_t clk, struct timespec *tp)
 {
     if (clk == CLOCK_MONOTONIC) {
@@ -137,6 +141,7 @@ static inline int clock_gettime(clockid_t clk, struct timespec *tp)
     }
     return 0;
 }
+#endif /* _MSC_VER */
 
 /* ── pthread_mutex — thin wrapper over CRITICAL_SECTION ─────────────────── *
  * Only implements the subset used by tb_infer.c:                             *

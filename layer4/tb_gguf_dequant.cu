@@ -56,9 +56,18 @@ __device__ __forceinline__ float d_f16_to_f32(uint16_t h) {
     uint32_t e = (h & 0x7C00u) >> 10;
     uint32_t m =  h & 0x03FFu;
     uint32_t b;
-    if      (e == 0)   b = s | (m << 13);
-    else if (e == 31)  b = s | 0x7F800000u | (m << 13);
-    else               b = s | ((e + 112u) << 23) | (m << 13);
+    if (e == 0) {
+        if (m == 0) { b = s; }
+        else {
+            uint32_t ee = 113u, mm = m;
+            while (!(mm & 0x400u)) { mm <<= 1; ee--; }
+            b = s | (ee << 23) | ((mm & 0x3FFu) << 13);
+        }
+    } else if (e == 31u) {
+        b = s | 0x7F800000u | (m << 13);
+    } else {
+        b = s | ((e + 112u) << 23) | (m << 13);
+    }
     return __uint_as_float(b);
 }
 
@@ -103,8 +112,8 @@ __global__ void k_q4k_matvec(
         for (int j=0;j<4;j++) {
             sc8[j]   = d  * (float)(sc[j]  &0x3F);
             mn8[j]   = dm * (float)(sc[j+4]&0x3F);
-            sc8[j+4] = d  * (float)((sc[j]>>6)|((sc[j+8]&0x0F)<<2));
-            mn8[j+4] = dm * (float)((sc[j+4]>>6)|((sc[j+8]>>4)<<2));
+            sc8[j+4] = d  * (float)((sc[j+8]&0x0F)|((sc[j]  >>6)<<4));
+            mn8[j+4] = dm * (float)((sc[j+8]>>4)  |((sc[j+4]>>6)<<4));
         }
         int bk = sbi*QK_K;
         for (int i=0;i<128;i++) {
@@ -175,8 +184,8 @@ __global__ void k_q5k_matvec(
         for (int j=0;j<4;j++) {
             sc8[j]   = d    * (float)(sc[j]   & 0x3F);
             mn8[j]   = dmin * (float)(sc[j+4] & 0x3F);
-            sc8[j+4] = d    * (float)((sc[j]  >>6) | ((sc[j+8] & 0x0F) << 2));
-            mn8[j+4] = dmin * (float)((sc[j+4]>>6) | ((sc[j+8] >> 4) << 2));
+            sc8[j+4] = d    * (float)((sc[j+8] & 0x0F) | ((sc[j]   >> 6) << 4));
+            mn8[j+4] = dmin * (float)((sc[j+8] >> 4)   | ((sc[j+4] >> 6) << 4));
         }
         int bk = sbi * QK_K;
         for (int i = 0; i < 256; i++) {
@@ -208,9 +217,15 @@ __global__ void k_q6k_matvec(
         float d = d_f16_to_f32(*(const uint16_t*)(sb+208));
         int bk = sbi*QK_K;
         for (int i=0;i<QK_K;i++) {
-            int lo = (ql[i>>1]>>((i&1)<<2))&0xF;
-            int hi = (qh[i>>2]>>((i&3)<<1))&0x3;
-            acc += d * (float)sc[i>>4] * (float)((lo|(hi<<4))-32) * x[bk+i];
+            int half   = i >> 7;
+            int within = i & 127;
+            int band   = within >> 5;
+            int l      = within & 31;
+            int ql_off = half*64 + l + (band & 1)*32;
+            int lo     = (band < 2) ? (ql[ql_off] & 0xF) : ((ql[ql_off] >> 4) & 0xF);
+            int hi     = (qh[half*32 + l] >> (band*2)) & 0x3;
+            int sc_idx = half*8 + (l >> 4) + band*2;
+            acc += d * (float)sc[sc_idx] * (float)((lo|(hi<<4))-32) * x[bk+i];
         }
     }
     { float _r = block_reduce(acc, smem); if (threadIdx.x == 0) out[row] = _r; }
@@ -422,34 +437,27 @@ void tb_cuda_set_snap(const TBOscSnapshot *s) { g_snap = s; }
 int tb_cuda_matvec_device(const void *Wdev, int qtype, int M, int K,
                            const float *x_host, float *out_host)
 {
-    static int g_mv_calls = 0;
-    int dbg = (g_mv_calls < 4);
-    if (dbg) fprintf(stderr, "[cmv%d] q=%d M=%d K=%d\n", g_mv_calls, qtype, M, K);
-    g_mv_calls++;
-
-    if (!_ensure_x(K)) { if(dbg) fprintf(stderr,"[cmv] ensure_x fail\n"); return 0; }
+    if (!_ensure_x(K)) return 0;
     cudaError_t ce = cudaMemcpy(g_d_x,x_host,(size_t)K*sizeof(float),cudaMemcpyHostToDevice);
-    if (ce!=cudaSuccess) { if(dbg) fprintf(stderr,"[cmv] H2D fail: %s\n",cudaGetErrorString(ce)); return 0; }
-    if (!_ensure_out(M)) { if(dbg) fprintf(stderr,"[cmv] ensure_out fail\n"); return 0; }
-    if (!_ensure_streams()) { if(dbg) fprintf(stderr,"[cmv] streams fail\n"); return 0; }
-    if (dbg) { fflush(stderr); }
+    if (ce!=cudaSuccess) return 0;
+    if (!_ensure_out(M)) { fprintf(stderr,"[cuda_fail] _ensure_out M=%d\n",M); return 0; }
+    if (!_ensure_streams()) return 0;
 
     int si = g_si; g_si = (g_si+1)%TB_N_STREAMS;
     cudaStream_t st = g_streams[si];
     ce = cudaStreamSynchronize(st);  /* wait for previous occupant of this slot */
-    if (ce!=cudaSuccess) { if(dbg) fprintf(stderr,"[cmv] pre-sync fail: %s\n",cudaGetErrorString(ce)); return 0; }
+    if (ce!=cudaSuccess) return 0;
 
     int blk = _block();
     int grd = _grid(M); if(grd<1) grd=1;
     const uint8_t *Wd = (const uint8_t*)Wdev;
-    if (dbg) { fprintf(stderr,"[cmv] launch grd=%d blk=%d si=%d\n",grd,blk,si); fflush(stderr); }
 
     switch (qtype) {
     case  1: k_f16_matvec  <<<grd,blk,0,st>>>((const uint16_t*)Wd,M,K,g_d_x,g_d_out[si]); break; /* F16 */
     case 12: k_q4k_matvec  <<<grd,blk,0,st>>>(Wd,M,K,g_d_x,g_d_out[si]); break;  /* Q4_K  */
     case 13: k_q5k_matvec  <<<grd,blk,0,st>>>(Wd,M,K,g_d_x,g_d_out[si]); break;  /* Q5_K  */
-    case 11:
-    case 21: k_q3k_matvec  <<<grd,blk,0,st>>>(Wd,M,K,g_d_x,g_d_out[si]); break;  /* Q3_K / IQ3_S */
+    case 11: k_q3k_matvec  <<<grd,blk,0,st>>>(Wd,M,K,g_d_x,g_d_out[si]); break;  /* Q3_K */
+    /* IQ3_S (21) intentionally absent: different block layout → CPU path */
     case 14: k_q6k_matvec  <<<grd,blk,0,st>>>(Wd,M,K,g_d_x,g_d_out[si]); break;  /* Q6_K  */
     case  2: k_q4_0_matvec <<<grd,blk,0,st>>>(Wd,M,K,g_d_x,g_d_out[si]); break;  /* Q4_0  */
     case  8: k_q8_0_matvec <<<grd,blk,0,st>>>(Wd,M,K,g_d_x,g_d_out[si]); break;  /* Q8_0  */
@@ -459,14 +467,20 @@ int tb_cuda_matvec_device(const void *Wdev, int qtype, int M, int K,
     default: return 0;
     }
     ce = cudaGetLastError();
-    if (dbg) { fprintf(stderr,"[cmv] post-launch ce=%d(%s)\n",ce,cudaGetErrorString(ce)); fflush(stderr); }
-    if (ce!=cudaSuccess) return 0;
+    if (ce!=cudaSuccess) {
+        fprintf(stderr, "[cuda_fail] kernel qtype=%d M=%d K=%d: %s\n",
+                qtype, M, K, cudaGetErrorString(ce));
+        cudaDeviceSynchronize(); /* drain sticky error before next call */
+        return 0;
+    }
     ce = cudaMemcpyAsync(g_h_pin[si],g_d_out[si],(size_t)M*sizeof(float),cudaMemcpyDeviceToHost,st);
-    if (ce!=cudaSuccess) { if(dbg) fprintf(stderr,"[cmv] D2H fail\n"); return 0; }
-    if (dbg) { fprintf(stderr,"[cmv] stream-sync...\n"); fflush(stderr); }
-    ce = cudaStreamSynchronize(st);
-    if (dbg) { fprintf(stderr,"[cmv] sync done ce=%d(%s)\n",ce,cudaGetErrorString(ce)); fflush(stderr); }
     if (ce!=cudaSuccess) return 0;
+    ce = cudaStreamSynchronize(st);
+    if (ce!=cudaSuccess) {
+        fprintf(stderr, "[cuda_fail] sync qtype=%d M=%d K=%d: %s\n",
+                qtype, M, K, cudaGetErrorString(ce));
+        return 0;
+    }
     memcpy(out_host,g_h_pin[si],(size_t)M*sizeof(float));
     return 1;
 }

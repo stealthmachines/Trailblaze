@@ -24,7 +24,7 @@ mkdir -p bin
 
 # Base flags
 CC="gcc"
-CFLAGS="-O3 -march=native -std=c11 -Wall -Wextra -Wno-unused-result -Wno-unused-parameter -mavx2 -mfma -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni -Wno-stringop-overflow -Wno-array-bounds"
+CFLAGS="-O3 -march=native -std=c11 -Wall -Wextra -Wno-unused-result -Wno-unused-parameter -mavx2 -mfma -Wno-stringop-overflow -Wno-array-bounds"
 if [ $DEBUG -eq 1 ]; then
     CFLAGS="-g -O0 -fsanitize=address,undefined -std=c11 -Wall"
     echo "  Mode: DEBUG (ASan+UBSan)"
@@ -33,7 +33,7 @@ else
 fi
 
 INC="-Ilayer0 -Ilayer1 -Ilayer2 -Ilayer3 -Ilayer4 -Ilayer5 -Iinclude -Isrc"
-LDFLAGS="-lm -lpthread"
+LDFLAGS="-lm -lpthread -lws2_32"
 
 TB_CORE="layer0/tb_phi_lattice.c layer1/tb_tensor.c layer2/tb_graph.c"
 

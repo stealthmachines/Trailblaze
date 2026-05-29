@@ -303,12 +303,14 @@ TB_KVCache* tb_kvcache_reconcile(const TB_KVCache *a, const TB_KVCache *b,
 void tb_attention(const float *q, const float *k, const float *v,
                   TB_KVCache *cache, int layer_idx,
                   int n_heads, int n_kv_heads, int head_dim,
+                  int pos,
                   float *out) {
     float scale = 1.0f / sqrtf((float)head_dim);
-    int   pos   = cache->seq_len;
     int   total = pos + 1;
 
-    /* Append k,v to cache */
+    /* Append k,v to cache at the caller-supplied pos.
+     * All 32 layers in one decode step share the same pos, so each layer's
+     * KV cache slot is written at the correct sequence position. */
     for (int h = 0; h < n_kv_heads; h++) {
         float *kslot = cache->keys[layer_idx]
                        + h * cache->max_seq * head_dim
@@ -319,8 +321,7 @@ void tb_attention(const float *q, const float *k, const float *v,
         memcpy(kslot, k + h * head_dim, head_dim * sizeof(float));
         memcpy(vslot, v + h * head_dim, head_dim * sizeof(float));
     }
-    /* Increment seq_len once per token (driven by layer 0 only, since all layers
-     * share the same seq_len counter but write to separate per-layer key/val arrays). */
+    /* Advance the sequence counter once per token (layer 0 is the trigger). */
     if (layer_idx == 0) cache->seq_len++;
 
     /* Grouped query: each query head → kv_head = h / (n_heads / n_kv_heads) */
@@ -400,6 +401,93 @@ void tb_attention(const float *q, const float *k, const float *v,
         if (l_i > 0.0f) {
             float inv_l = 1.0f / l_i;
             for (int d = 0; d < head_dim; d++) outh[d] *= inv_l;
+        }
+    }
+}
+
+/* GQA attention with separate Q/K and V head dims.
+ * Handles architectures (e.g. Qwen3.5) where HD_k != HD_v:
+ *   HD_k=256 for Q*K attention scoring, HD_v=128 for value accumulation,
+ *   NK_k*HD_k == NK_v*HD_v (same total KV cache slot size per position).
+ */
+void tb_attention_split_kv(const float *q, const float *k, const float *v,
+                           TB_KVCache *cache, int layer_idx,
+                           int n_heads, int NK_k, int HD_k,
+                           int NK_v, int HD_v,
+                           int pos, float *out)
+{
+    float scale = 1.0f / sqrtf((float)HD_k);
+    int   total = pos + 1;
+
+    /* Write K: NK_k heads × HD_k dims */
+    for (int h = 0; h < NK_k; h++) {
+        float *kslot = cache->keys[layer_idx]
+                       + (size_t)h * cache->max_seq * HD_k
+                       + (size_t)pos * HD_k;
+        memcpy(kslot, k + h * HD_k, HD_k * sizeof(float));
+    }
+    /* Write V: NK_v heads × HD_v dims (same total bytes as NK_k*HD_k) */
+    for (int h = 0; h < NK_v; h++) {
+        float *vslot = cache->vals[layer_idx]
+                       + (size_t)h * cache->max_seq * HD_v
+                       + (size_t)pos * HD_v;
+        memcpy(vslot, v + h * HD_v, HD_v * sizeof(float));
+    }
+    if (layer_idx == 0) cache->seq_len++;
+
+    float tile_scores[TB_ATTN_TILE];
+
+    for (int h = 0; h < n_heads; h++) {
+        int kv_k = (NK_k > 0) ? (h * NK_k / n_heads) : 0;
+        int kv_v = (NK_v > 0) ? (h * NK_v / n_heads) : 0;
+        const float *qh  = q + (size_t)h * HD_k;
+        float       *outh = out + (size_t)h * HD_v;
+        memset(outh, 0, HD_v * sizeof(float));
+
+        float m_i = -1e38f;
+        float l_i =  0.0f;
+
+        for (int t_start = 0; t_start < total; t_start += TB_ATTN_TILE) {
+            int t_end  = t_start + TB_ATTN_TILE;
+            if (t_end > total) t_end = total;
+            int tile_n = t_end - t_start;
+
+            for (int ti = 0; ti < tile_n; ti++) {
+                const float *kt = cache->keys[layer_idx]
+                                  + (size_t)kv_k * cache->max_seq * HD_k
+                                  + (size_t)(t_start + ti) * HD_k;
+                float dot = 0.0f;
+                for (int d = 0; d < HD_k; d++) dot += qh[d] * kt[d];
+                tile_scores[ti] = dot * scale;
+            }
+
+            float m_new = m_i;
+            for (int ti = 0; ti < tile_n; ti++)
+                if (tile_scores[ti] > m_new) m_new = tile_scores[ti];
+
+            float rescale = expf(m_i - m_new);
+            float l_new   = rescale * l_i;
+            for (int ti = 0; ti < tile_n; ti++) {
+                tile_scores[ti] = expf(tile_scores[ti] - m_new);
+                l_new += tile_scores[ti];
+            }
+
+            for (int d = 0; d < HD_v; d++) outh[d] *= rescale;
+            for (int ti = 0; ti < tile_n; ti++) {
+                const float *vt = cache->vals[layer_idx]
+                                  + (size_t)kv_v * cache->max_seq * HD_v
+                                  + (size_t)(t_start + ti) * HD_v;
+                float a = tile_scores[ti];
+                for (int d = 0; d < HD_v; d++) outh[d] += a * vt[d];
+            }
+
+            m_i = m_new;
+            l_i = l_new;
+        }
+
+        if (l_i > 0.0f) {
+            float inv_l = 1.0f / l_i;
+            for (int d = 0; d < HD_v; d++) outh[d] *= inv_l;
         }
     }
 }
@@ -709,7 +797,7 @@ int main(void) {
     /* Append one token */
     float q_data[4*8], k_data[4*8], v_data[4*8], attn_out[4*8];
     for (int i = 0; i < 32; i++) { q_data[i]=0.1f; k_data[i]=0.1f; v_data[i]=0.2f; }
-    tb_attention(q_data, k_data, v_data, kv, 0, 4, 4, 8, attn_out);
+    tb_attention(q_data, k_data, v_data, kv, 0, 4, 4, 8, kv->seq_len, attn_out);
     assert(kv->seq_len == 1);
     printf("[KV cache] append: seq_len=%d PASS\n", kv->seq_len);
 
@@ -717,7 +805,7 @@ int main(void) {
     TB_KVCache *kv2 = tb_kvcache_fork(kv, 2);
     float q2[4*8], k2[4*8], v2[4*8], ao2[4*8];
     for (int i = 0; i < 32; i++) { q2[i]=0.2f; k2[i]=0.2f; v2[i]=0.3f; }
-    tb_attention(q2, k2, v2, kv2, 0, 4, 4, 8, ao2);
+    tb_attention(q2, k2, v2, kv2, 0, 4, 4, 8, kv2->seq_len, ao2);
     assert(kv->seq_len == 1 && kv2->seq_len == 2);
     printf("[KV fork] branch1.seq=%d branch2.seq=%d PASS\n", kv->seq_len, kv2->seq_len);
 

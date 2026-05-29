@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "tri-voice-a": {
+      "type": "sse",
+      "url": "http://localhost:3333/sse"
+    },
+    "tri-voice-b": {
+      "type": "sse",
+      "url": "http://localhost:3334/sse"
+    }
+  }
+}

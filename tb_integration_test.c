@@ -135,11 +135,11 @@ int main(void) {
     /* KV cache COW fork */
     TB_KVCache *kv = tb_kvcache_alloc(2, 4, 16, 64, 1, lat->epoch);
     float q_arr[64]={0}, k_arr[64]={0.1f}, v_arr[64]={0.2f}, ao[64];
-    tb_attention(q_arr, k_arr, v_arr, kv, 0, 4, 4, 16, ao);
+    tb_attention(q_arr, k_arr, v_arr, kv, 0, 4, 4, 16, kv->seq_len, ao);
     assert(kv->seq_len == 1);
     TB_KVCache *kv2 = tb_kvcache_fork(kv, 2);
     float q2[64]={0.1f}, k2[64]={0.1f}, v2[64]={0.3f}, ao2[64];
-    tb_attention(q2, k2, v2, kv2, 0, 4, 4, 16, ao2);
+    tb_attention(q2, k2, v2, kv2, 0, 4, 4, 16, kv2->seq_len, ao2);
     assert(kv->seq_len==1 && kv2->seq_len==2);
     PASS("KV cache COW fork: branch1.seq=1, branch2.seq=2");
     tb_lattice_advance(lat, 1);
@@ -280,7 +280,7 @@ int main(void) {
     TB_KVCache *kv3 = tb_kvcache_alloc(2,4,16,64,b[0],lat->epoch);
     tree->branches[b[0]]->kv_cache = kv3;
     float q3[64]={0.1f},k3[64]={0.1f},v3[64]={0.1f},ao3[64];
-    tb_attention(q3,k3,v3,kv3,0,4,4,16,ao3);
+    tb_attention(q3,k3,v3,kv3,0,4,4,16,kv3->seq_len,ao3);
     assert(kv3->seq_len==1);
     int32_t ep_before = lat->epoch;
     tb_tree_epoch_advance(tree, 1);

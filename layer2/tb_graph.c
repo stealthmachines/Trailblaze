@@ -786,7 +786,7 @@ int main(void) {
     TB_KVCache *kv = tb_kvcache_alloc(2, 4, 8, 32, b2, lat->epoch);
     tree->branches[b2]->kv_cache = kv;
     float q[32]={0}, k[32]={0}, v[32]={0.1f}, ao[32];
-    tb_attention(q, k, v, kv, 0, 4, 4, 8, ao);
+    tb_attention(q, k, v, kv, 0, 4, 4, 8, kv->seq_len, ao);
     assert(kv->seq_len == 1);
     int32_t old_ep = lat->epoch;
     tb_tree_epoch_advance(tree, 1);

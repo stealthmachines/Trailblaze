@@ -211,8 +211,8 @@ static void q4k_unpack_scales(const uint8_t *sc12,
             min_raw   = sc12[j+4] & 0x3F;
         } else {
             int k = j - 4;
-            scale_raw = (sc12[k]   >> 6) | ((sc12[k+8]  & 0x0F) << 2);
-            min_raw   = (sc12[k+4] >> 6) | ((sc12[k+8] >> 4) << 2);
+            scale_raw = (sc12[k+8] & 0x0F) | ((sc12[k]   >> 6) << 4);
+            min_raw   = (sc12[k+8] >> 4)   | ((sc12[k+4] >> 6) << 4);
         }
         scales[j] = d_all    * scale_raw;
         mins[j]   = dmin_all * min_raw;
@@ -225,8 +225,8 @@ float tb_dot_q4k_scalar(const uint8_t *row, int K, const float *x) {
     const uint8_t *p = row;
 
     for (int b = 0; b < n_blocks; b++) {
-        float d_all    = bf16_to_f32(((uint16_t)p[1] << 8) | p[0]);
-        float dmin_all = bf16_to_f32(((uint16_t)p[3] << 8) | p[2]);
+        float d_all    = f16_to_f32(((uint16_t)p[1] << 8) | p[0]);
+        float dmin_all = f16_to_f32(((uint16_t)p[3] << 8) | p[2]);
         const uint8_t *sc12 = p + 4;
         const uint8_t *qs   = p + 16;
 
@@ -263,7 +263,7 @@ float tb_dot_q3k_scalar(const uint8_t *row, int K, const float *x) {
         const uint8_t *hmask  = p;
         const uint8_t *qs     = p + 32;
         const uint8_t *sc_raw = p + 96;
-        float d_all = bf16_to_f32(((uint16_t)p[109] << 8) | p[108]);
+        float d_all = f16_to_f32(((uint16_t)p[109] << 8) | p[108]);
 
         /* Decode 16 × 6-bit scales */
         float scales[16];
@@ -283,6 +283,39 @@ float tb_dot_q3k_scalar(const uint8_t *row, int K, const float *x) {
             if (base + i < K) acc += w * x[base + i];
         }
         p += 110;
+    }
+    return acc;
+}
+
+/* Q5_K superblock (176 bytes, 256 weights):
+ * [d:f16 2][dmin:f16 2][scales:12][qh:32][qs:128]
+ * Same 6-bit scale packing as Q4_K; 5-bit weight = qs_nibble | (qh_bit<<4) */
+float tb_dot_q5k_scalar(const uint8_t *row, int K, const float *x) {
+    float acc = 0.0f;
+    int n_blocks = (K + QK_K - 1) / QK_K;
+    const uint8_t *p = row;
+
+    for (int b = 0; b < n_blocks; b++) {
+        float d_all    = f16_to_f32(((uint16_t)p[1] << 8) | p[0]);
+        float dmin_all = f16_to_f32(((uint16_t)p[3] << 8) | p[2]);
+        const uint8_t *sc12 = p + 4;
+        const uint8_t *qh   = p + 16;  /* 32 bytes: high bit per weight */
+        const uint8_t *qs   = p + 48;  /* 128 bytes: low nibble per weight */
+
+        float scales[8], mins[8];
+        q4k_unpack_scales(sc12, d_all, dmin_all, scales, mins);
+
+        int base = b * QK_K;
+        for (int i = 0; i < QK_K; i++) {
+            if (base + i >= K) break;
+            int g      = i >> 5;
+            int qh_bit = (qh[i >> 3] >> (i & 7)) & 1;
+            int lo4    = (qs[i >> 1] >> ((i & 1) << 2)) & 0xF;
+            int q5     = lo4 | (qh_bit << 4);
+            float w    = scales[g] * (float)q5 - mins[g];
+            acc += w * x[base + i];
+        }
+        p += 176;
     }
     return acc;
 }
@@ -345,8 +378,8 @@ float tb_dot_q4k_avx2(const uint8_t *row, int K, const float *x) {
     float wbuf[QK_K];
 
     for (int b = 0; b < n_blocks; b++) {
-        float d_all    = bf16_to_f32(((uint16_t)p[1] << 8) | p[0]);
-        float dmin_all = bf16_to_f32(((uint16_t)p[3] << 8) | p[2]);
+        float d_all    = f16_to_f32(((uint16_t)p[1] << 8) | p[0]);
+        float dmin_all = f16_to_f32(((uint16_t)p[3] << 8) | p[2]);
         float scales[8], mins[8];
         q4k_unpack_scales(p + 4, d_all, dmin_all, scales, mins);
 
@@ -394,7 +427,7 @@ float tb_dot_q3k_avx2(const uint8_t *row, int K, const float *x) {
         const uint8_t *hmask  = p;
         const uint8_t *qs     = p + 32;
         const uint8_t *sc_raw = p + 96;
-        float d = bf16_to_f32(((uint16_t)p[109] << 8) | p[108]);
+        float d = f16_to_f32(((uint16_t)p[109] << 8) | p[108]);
 
         float scales[16];
         for (int j = 0; j < 16; j++) {
@@ -507,8 +540,8 @@ float tb_dot_q4k_avx512(const uint8_t *row, int K, const float *x) {
     float wbuf[QK_K];
 
     for (int b = 0; b < n_blocks; b++) {
-        float d_all    = bf16_to_f32(((uint16_t)p[1] << 8) | p[0]);
-        float dmin_all = bf16_to_f32(((uint16_t)p[3] << 8) | p[2]);
+        float d_all    = f16_to_f32(((uint16_t)p[1] << 8) | p[0]);
+        float dmin_all = f16_to_f32(((uint16_t)p[3] << 8) | p[2]);
         float scales[8], mins[8];
         q4k_unpack_scales(p + 4, d_all, dmin_all, scales, mins);
 
@@ -699,20 +732,20 @@ void tb_dispatch_matvec(const void *W, int qtype, int M, int K,
             break;
         }
 
-        default: /* Q2_K, Q5_K, Q6_K, Q8_K — scalar fallback */
+        case 13: /* Q5_K */
+            dot = tb_dot_q5k_scalar(Wp8 + m * row_bytes, K, x);
+            break;
+
+        default: /* Q2_K, Q6_K, Q8_K — scalar fallback (zeroes; CUDA handles these) */
             {
-                /* Generic path: dequantize block-by-block on stack,
-                 * avoiding heap allocation.  Stack buffer: one block. */
                 float wbuf[256]; /* max QK_K */
                 int n_blocks = blocks_per_row;
                 const uint8_t *bp = Wp8 + m * row_bytes;
                 float acc = 0.0f;
                 int base = 0;
                 for (int bl = 0; bl < n_blocks; bl++) {
-                    /* Use Q3_K scalar path for Q3; others fall through */
                     int n = (base + bw <= K) ? bw : (K - base);
                     (void)wbuf; (void)n;
-                    /* For unsupported qtypes, zero output safely */
                     bp += bb;
                     base += bw;
                 }

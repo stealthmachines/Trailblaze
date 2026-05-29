@@ -94,8 +94,16 @@ static float f16_to_f32(uint16_t h) {
     uint32_t exponent = (h & 0x7C00u) >> 10;
     uint32_t mantissa = (h & 0x03FFu);
     uint32_t bits;
-    if      (exponent == 0)    bits = sign | (mantissa << 13);
-    else if (exponent == 31)   bits = sign | 0x7F800000u | (mantissa << 13);
+    if (exponent == 0) {
+        if (mantissa == 0) { bits = sign; }  /* ±0 */
+        else {
+            /* normalize F16 subnormal → F32 normal:
+             * F16 value = 2^(-14) × (mantissa/1024); bias from 113 = 127-14 */
+            uint32_t e = 113, m = mantissa;
+            while (!(m & 0x400)) { m <<= 1; e--; }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exponent == 31) bits = sign | 0x7F800000u | (mantissa << 13);
     else                       bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
     float f; memcpy(&f, &bits, 4); return f;
 }
@@ -122,26 +130,15 @@ static void dequant_q4_0_block(const uint8_t *block, float *out) {
 static void q4_k_unpack_scales(const uint8_t sc[12],
                                  float d, float dmin,
                                  float scales[8], float mins[8]) {
-    /* 6-bit packed: 4 full bytes encode 5.33 values → 12 bytes = 8 pairs */
-    /* ggml packing:
-     *   sc[j]     = (scales[j] & 0x3F) | ((scales[j+4] & 0x0F) << 6)  for j<4
-     *   sc[j+8]   = (mins[j]   & 0x3F) | ((mins[j+4]   & 0x0F) << 6)  for j<4
-     *   etc. — full 6-bit extraction per GGML source */
-    for (int j = 0; j < 8; j++) {
-        /* Extract 6-bit scale */
-        int scale_raw, min_raw;
-        if (j < 4) {
-            scale_raw = sc[j]   & 0x3F;
-            min_raw   = sc[j+4] & 0x3F;
-        } else {
-            int k = j - 4;
-            scale_raw = (sc[k]   >> 6) | ((sc[k+8]  & 0x0F) << 2);
-            min_raw   = (sc[k+4] >> 6) | ((sc[k+12] & 0x0F) << 2);
-        }
-        scales[j] = d    * (float)scale_raw;
-        mins[j]   = dmin * (float)min_raw;
+    /* Matches ggml get_scale_min_k4: for j<4 take low 6 bits; for j>=4 the
+     * 6-bit value is (extension_nibble | (overflow_bits << 4)), not the
+     * reverse.  Wrong bit order was the root cause of garbled inference. */
+    for (int j = 0; j < 4; j++) {
+        scales[j]   = d    * (float)(sc[j]   & 0x3F);
+        mins[j]     = dmin * (float)(sc[j+4] & 0x3F);
+        scales[j+4] = d    * (float)((sc[j+8] & 0x0F) | ((sc[j]   >> 6) << 4));
+        mins[j+4]   = dmin * (float)((sc[j+8] >> 4)   | ((sc[j+4] >> 6) << 4));
     }
-
 }
 
 /* Simplified Q4_K dequant — covers the common case correctly */
@@ -157,21 +154,15 @@ static void dequant_q4_k_block(const uint8_t *superblock, float *out) {
     const uint8_t *sc = superblock + 4;
     const uint8_t *qs = superblock + 16;
 
-    /* Unpack scales and mins for 8 sub-blocks of 32 weights each */
+    /* Unpack scales and mins for 8 sub-blocks of 32 weights each. */
     float scales[8], mins[8];
-    /* Simple 6-bit extraction matching ggml_vec_dot_q4_K_q8_K */
-    for (int j = 0; j < 8; j++) {
-        uint8_t scale_byte = sc[j < 4 ? j : j+8-4];
-        uint8_t min_byte   = sc[j < 4 ? j+4 : j+8];
-        scales[j] = d    * (float)(scale_byte & 0x3F);
-        mins[j]   = dmin * (float)(min_byte   & 0x3F);
-    }
+    q4_k_unpack_scales(sc, d, dmin, scales, mins);
 
     /* Decode 256 nibbles */
     for (int i = 0; i < 128; i++) {
         uint8_t byte    = qs[i];
-        int     sub0    = (2*i)   / 32;   /* sub-block for even nibble */
-        int     sub1    = (2*i+1) / 32;   /* sub-block for odd nibble  */
+        int     sub0    = (2*i)   >> 5;   /* sub-block for even nibble */
+        int     sub1    = (2*i+1) >> 5;   /* sub-block for odd nibble  */
         float   lo_nibble = (float)(byte & 0xF);
         float   hi_nibble = (float)(byte >>   4);
         out[2*i+0] = scales[sub0] * lo_nibble - mins[sub0];
@@ -193,13 +184,21 @@ static void dequant_q6_k_block(const uint8_t *sb, float *out) {
     const uint8_t *qh = sb + 128;
     const int8_t  *sc = (const int8_t*)(sb + 192);
     float           d  = f16_to_f32(*(const uint16_t*)(sb + 208));
+    /* GGUF Q6_K interleaved layout: within each 128-element half, elements are
+     * grouped into 4 bands of 32. ql stores 4-bit low nibbles; bands 0&1 share
+     * each byte (low nibble = band 0, high nibble = band 2), and ql[l+32] covers
+     * bands 1&3. qh packs all 4 bands' 2-bit hi portions into one byte per l. */
     for (int i = 0; i < 256; i++) {
-        int lo = (ql[i/2] >> (4*(i&1))) & 0xF;
-        int hi = (qh[i/4] >> (2*(i&3))) & 0x3;
-        int q  = lo | (hi << 4);
-        q -= 32;   /* unsigned→signed */
-        int sub = i / 16;
-        out[i] = d * (float)sc[sub] * (float)q;
+        int half   = i >> 7;
+        int within = i & 127;
+        int band   = within >> 5;
+        int l      = within & 31;
+        int ql_off = half*64 + l + (band & 1)*32;
+        int lo     = (band < 2) ? (ql[ql_off] & 0xF) : ((ql[ql_off] >> 4) & 0xF);
+        int hi     = (qh[half*32 + l] >> (band*2)) & 0x3;
+        int sc_idx = half*8 + (l >> 4) + band*2;
+        int q      = (lo | (hi << 4)) - 32;
+        out[i] = d * (float)sc[sc_idx] * (float)q;
     }
 }
 
@@ -256,6 +255,98 @@ static void dequant_q3_k_block(const uint8_t *sb, float *out) {
     }
 }
 
+/* ── IQ3_S superblock (110 bytes, 256 weights) ──────────────────────────── */
+/* layout: [d:f16 2][qs:64][qh:8][signs:32][scales:4]
+ * d at offset 0 (NOT 108 like Q3_K!) — aliasing to Q3_K kernel causes NaN.
+ * Real iq3s_grid extracted from ggml-base.dll offset 0x9A000.               */
+static const uint32_t iq3s_grid[512] = {
+    0x01010101, 0x01010103, 0x01010105, 0x0101010B, 0x0101010F, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030D, 0x01010501, 0x01010503, 0x0101050B, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090B, 0x0101090F, 0x01010B03, 0x01010B07, 0x01010D01, 0x01010D05, 0x01010F03, 0x01010F09,
+    0x01010F0F, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030B,
+    0x01030501, 0x01030507, 0x0103050F, 0x01030703, 0x0103070B, 0x01030909, 0x01030D03, 0x01030D0B,
+    0x01030F05, 0x01050101, 0x01050103, 0x0105010B, 0x0105010F, 0x01050301, 0x01050307, 0x0105030D,
+    0x01050503, 0x0105050B, 0x01050701, 0x01050709, 0x01050905, 0x0105090B, 0x0105090F, 0x01050B03,
+    0x01050B07, 0x01050F01, 0x01050F07, 0x01070107, 0x01070303, 0x0107030B, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070D, 0x01070909, 0x01070B01, 0x01070B05, 0x01070D0F, 0x01070F03,
+    0x01070F0B, 0x01090101, 0x01090307, 0x0109030F, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090B03, 0x01090F01, 0x010B0105, 0x010B0109, 0x010B0501, 0x010B0505, 0x010B050D,
+    0x010B0707, 0x010B0903, 0x010B090B, 0x010B090F, 0x010B0D0D, 0x010B0F07, 0x010D010D, 0x010D0303,
+    0x010D0307, 0x010D0703, 0x010D0B05, 0x010D0F03, 0x010F0101, 0x010F0105, 0x010F0109, 0x010F0501,
+    0x010F0505, 0x010F050D, 0x010F0707, 0x010F0B01, 0x010F0B09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030B, 0x0301030F, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070D, 0x03010B09, 0x03010B0D, 0x03010D03, 0x03010F05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010D, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030B01, 0x03030B05, 0x03030F01, 0x03030F0D, 0x03050101, 0x03050305, 0x0305030B,
+    0x0305030F, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050B0B, 0x03050D01,
+    0x03050F05, 0x03070103, 0x03070109, 0x0307010F, 0x03070301, 0x03070307, 0x03070503, 0x0307050F,
+    0x03070701, 0x03070709, 0x03070903, 0x03070D05, 0x03070F01, 0x03090107, 0x0309010B, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090D, 0x03090B01, 0x03090B09, 0x030B0103,
+    0x030B0301, 0x030B0307, 0x030B0503, 0x030B0701, 0x030B0705, 0x030B0B03, 0x030D0501, 0x030D0509,
+    0x030D050F, 0x030D0909, 0x030D090D, 0x030F0103, 0x030F0107, 0x030F0301, 0x030F0305, 0x030F0503,
+    0x030F070B, 0x030F0903, 0x030F0D05, 0x030F0F01, 0x05010101, 0x05010103, 0x05010107, 0x0501010B,
+    0x0501010F, 0x05010301, 0x05010305, 0x05010309, 0x0501030D, 0x05010503, 0x05010507, 0x0501050F,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090B, 0x05010B01, 0x05010B05, 0x05010D0F,
+    0x05010F01, 0x05010F07, 0x05010F0B, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030F,
+    0x05030505, 0x0503050B, 0x05030703, 0x05030709, 0x05030905, 0x05030B03, 0x05050103, 0x05050109,
+    0x0505010F, 0x05050503, 0x05050507, 0x05050701, 0x0505070F, 0x05050903, 0x05050B07, 0x05050B0F,
+    0x05050F03, 0x05050F09, 0x05070101, 0x05070105, 0x0507010B, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070B01, 0x05070D0D, 0x05090103, 0x0509010F, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070B, 0x05090903, 0x05090F05, 0x05090F0B, 0x050B0109, 0x050B0303,
+    0x050B0505, 0x050B070F, 0x050B0901, 0x050B0B07, 0x050B0F01, 0x050D0101, 0x050D0105, 0x050D010F,
+    0x050D0503, 0x050D0B0B, 0x050D0D03, 0x050F010B, 0x050F0303, 0x050F050D, 0x050F0701, 0x050F0907,
+    0x050F0B01, 0x07010105, 0x07010303, 0x07010307, 0x0701030B, 0x0701030F, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070B, 0x07010905, 0x07010909, 0x0701090F, 0x07010B03, 0x07010D07, 0x07010F03,
+    0x07030103, 0x07030107, 0x0703010B, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030D01,
+    0x07030F05, 0x07030F0D, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050B01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050F, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090F, 0x07070B0B, 0x07070F07, 0x07090107, 0x07090303, 0x0709030D, 0x07090505,
+    0x07090703, 0x07090B05, 0x07090D01, 0x07090D09, 0x070B0103, 0x070B0301, 0x070B0305, 0x070B050B,
+    0x070B0705, 0x070B0909, 0x070B0B0D, 0x070B0F07, 0x070D030D, 0x070D0903, 0x070F0103, 0x070F0107,
+    0x070F0501, 0x070F0505, 0x070F070B, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050F, 0x09010705, 0x09010903, 0x09010B01, 0x09010F01, 0x09030105, 0x0903010F, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070B, 0x09030907, 0x09030B03, 0x09030B0B, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030B, 0x09050503, 0x09050707, 0x09050901, 0x09050B0F, 0x09050D05,
+    0x09050F01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070B,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070F, 0x09090901, 0x09090F03, 0x090B010B, 0x090B010F,
+    0x090B0503, 0x090B0D05, 0x090D0307, 0x090D0709, 0x090D0D01, 0x090F0301, 0x090F030B, 0x090F0701,
+    0x090F0907, 0x090F0B03, 0x0B010105, 0x0B010301, 0x0B010309, 0x0B010505, 0x0B010901, 0x0B010909,
+    0x0B01090F, 0x0B010B05, 0x0B010D0D, 0x0B010F09, 0x0B030103, 0x0B030107, 0x0B03010B, 0x0B030305,
+    0x0B030503, 0x0B030705, 0x0B030F05, 0x0B050101, 0x0B050303, 0x0B050507, 0x0B050701, 0x0B05070D,
+    0x0B050B07, 0x0B070105, 0x0B07010F, 0x0B070301, 0x0B07050F, 0x0B070909, 0x0B070B03, 0x0B070D0B,
+    0x0B070F07, 0x0B090103, 0x0B090109, 0x0B090501, 0x0B090705, 0x0B09090D, 0x0B0B0305, 0x0B0B050D,
+    0x0B0B0B03, 0x0B0B0B07, 0x0B0D0905, 0x0B0F0105, 0x0B0F0109, 0x0B0F0505, 0x0D010303, 0x0D010307,
+    0x0D01030B, 0x0D010703, 0x0D010707, 0x0D010D01, 0x0D030101, 0x0D030501, 0x0D03050F, 0x0D030D09,
+    0x0D050305, 0x0D050709, 0x0D050905, 0x0D050B0B, 0x0D050D05, 0x0D050F01, 0x0D070101, 0x0D070309,
+    0x0D070503, 0x0D070901, 0x0D09050B, 0x0D090907, 0x0D090D05, 0x0D0B0101, 0x0D0B0107, 0x0D0B0709,
+    0x0D0B0D01, 0x0D0D010B, 0x0D0D0901, 0x0D0F0303, 0x0D0F0307, 0x0F010101, 0x0F010109, 0x0F01010F,
+    0x0F010501, 0x0F010505, 0x0F01070D, 0x0F010901, 0x0F010B09, 0x0F010D05, 0x0F030105, 0x0F030303,
+    0x0F030509, 0x0F030907, 0x0F03090B, 0x0F050103, 0x0F050109, 0x0F050301, 0x0F05030D, 0x0F050503,
+    0x0F050701, 0x0F050B03, 0x0F070105, 0x0F070705, 0x0F07070B, 0x0F070B07, 0x0F090103, 0x0F09010B,
+    0x0F090307, 0x0F090501, 0x0F090B01, 0x0F0B0505, 0x0F0B0905, 0x0F0D0105, 0x0F0D0703, 0x0F0F0101
+};
+
+static void dequant_iq3_s_block(const uint8_t *sb, float *out) {
+    float d              = f16_to_f32(*(const uint16_t*)(sb +   0));
+    const uint8_t *qs    = sb +  2;   /* 64 bytes: low 8 bits of 9-bit grid index */
+    const uint8_t *qh    = sb + 66;   /* 8 bytes: 1 high bit per lookup, packed lsb-first */
+    const uint8_t *signs = sb + 74;   /* 32 bytes: flat bit array, 1 sign bit per weight */
+    const uint8_t *sc    = sb + 106;  /* 4 bytes: 8 × 4-bit subscales, 2 per byte */
+    for (int k = 0; k < 64; k++) {
+        int hi  = (qh[k >> 3] >> (k & 7)) & 1;
+        int idx = qs[k] | (hi << 8);
+        const uint8_t *gv = (const uint8_t *)&iq3s_grid[idx];
+        int g   = k >> 3;  /* group 0-7 (8 lookups per group, 32 weights each) */
+        float dl = d * (float)(1 + 2 * ((sc[g >> 1] >> (4 * (g & 1))) & 0xf));
+        int w0  = k * 4;
+        for (int j = 0; j < 4; j++) {
+            int w   = w0 + j;
+            int sgn = (signs[w >> 3] >> (w & 7)) & 1;
+            out[w]  = dl * (float)gv[j] * (sgn ? -1.0f : 1.0f);
+        }
+    }
+}
+
 /* ── Q5_K superblock (176 bytes, 256 weights) ───────────────────────────── */
 /* layout: [d:f16 2][dmin:f16 2][scales:12][qh:32][qs:128]                   */
 /* Same 6-bit scale packing as Q4_K.  5-bit weight = qs_nibble | (qh_bit<<4) */
@@ -290,6 +381,38 @@ static void dequant_q8_k_block(const uint8_t *sb, float *out) {
 /* ── Public dequantise-one-row ────────────────────────────────────────────── */
 /* Dequantises `n_weights` weights from tensor data into out[].
  * `qtype` is TB_QType from tb_infer.h. */
+
+/* ── IQ4_XS superblock (136 bytes, 256 weights) ─────────────────────────────
+ * Layout (llama.cpp ggml-quants.h):
+ *   ggml_half  d          2 bytes  global scale
+ *   uint16_t   scales_h   2 bytes  2 high bits per group, 8 groups packed lsb-first
+ *   int8_t     scales_l[4] 4 bytes 4 low bits per group (8 groups x 4 bits)
+ *   uint8_t    qs[128]   128 bytes 4 bits per weight, low then high nibble
+ * Total: 136 bytes / 256 weights.
+ * Weights use the iq4nl 16-entry lookup table.
+ */
+static const int8_t iq4nl_table[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+static void dequant_iq4_xs_block(const uint8_t *sb, float *out) {
+    float    d        = f16_to_f32(*(const uint16_t*)(sb + 0));
+    uint16_t scales_h = *(const uint16_t*)(sb + 2);
+    const int8_t  *sl = (const int8_t *)(sb + 4);
+    const uint8_t *qs = sb + 8;
+    for (int g = 0; g < 8; g++) {
+        int sl_nibble = ((int)sl[g >> 1] >> (4 * (g & 1))) & 0xF;
+        int sh_bits   = ((int)scales_h   >> (2 *  g))      & 0x3;
+        float scale   = d * (float)((sl_nibble | (sh_bits << 4)) - 32);
+        int base = g * 16;
+        for (int j = 0; j < 16; j++) {
+            uint8_t byte = qs[base + j];
+            out[g*32 + 2*j + 0] = scale * (float)iq4nl_table[byte & 0xF];
+            out[g*32 + 2*j + 1] = scale * (float)iq4nl_table[byte >> 4];
+        }
+    }
+}
+
 void tb_gguf_dequant_row(const void *data, int qtype, int n_weights,
                           float *out) {
     const uint8_t *p = (const uint8_t*)data;
@@ -342,6 +465,20 @@ void tb_gguf_dequant_row(const void *data, int qtype, int n_weights,
             n_out += 256;
         }
         break;
+    case 21: /* IQ3_S - 110 bytes/superblock, 256 weights (different layout from Q3_K!) */
+        while (n_out < n_weights) {
+            dequant_iq3_s_block(p, out + n_out);
+            p += 110;
+            n_out += 256;
+        }
+        break;
+    case 23: /* IQ4_XS - 136 bytes/superblock, 256 weights */
+        while (n_out < n_weights) {
+            dequant_iq4_xs_block(p, out + n_out);
+            p += 136;
+            n_out += 256;
+        }
+        break;
     case 13: /* Q5_K - 176 bytes/superblock, 256 weights */
         while (n_out < n_weights) {
             dequant_q5_k_block(p, out + n_out);
@@ -386,7 +523,8 @@ void tb_gguf_dequant_matvec(const void *W, int qtype, int M, int K,
     case 12: block_weights = QK_K;    block_bytes = 144; break;  /* Q4_K */
     case 10: block_weights = 256;     block_bytes = 84;  break;  /* Q2_K */
     case 11: block_weights = 256;     block_bytes = 110; break;  /* Q3_K */
-    case 21: block_weights = 256;     block_bytes = 110; break;  /* IQ3_S — decoded via Q3_K path */
+    case 21: block_weights = 256;     block_bytes = 110; break;  /* IQ3_S — CPU path via dequant_iq3_s_block */
+    case 23: block_weights = 256;     block_bytes = 136; break;  /* IQ4_XS */
     case 13: block_weights = 256;     block_bytes = 176; break;  /* Q5_K */
     case 15: block_weights = 256;     block_bytes = 292; break;  /* Q8_K */
     case 14: block_weights = 256;     block_bytes = 210; break;  /* Q6_K */
@@ -433,33 +571,30 @@ void tb_dispatch_context_set(const TBOscSnapshot *snap, const TBCpuCaps *caps) {
 #endif
 }
 
-static int g_matvec_dbg = 0; /* print first 6 matvec calls for hang diagnosis */
-
 void tb_gguf_tensor_matvec(const TB_GGUFLoaded *g, const TB_GGUFTensorInfo *t,
                             int M, int K, const float *x, float *out)
 {
-    int dbg = (g_matvec_dbg < 6);
-    if (dbg) { fprintf(stderr, "[mv] M=%d K=%d qtype=%d gpu=%s name=%.32s\n", M,K,t->qtype, t->d_data?"Y":"N", t->name); fflush(stderr); }
 #ifdef TB_CUDA
     if (t->d_data) {
-        if (dbg) { fprintf(stderr, "[mv] -> cuda\n"); fflush(stderr); }
         int ok = tb_cuda_matvec_device(t->d_data, t->qtype, M, K, x, out);
-        if (dbg) { fprintf(stderr, "[mv] cuda ret=%d\n", ok); fflush(stderr); }
-        g_matvec_dbg++;
         if (ok) return;
         /* GPU failed — fall through to CPU */
     }
 #endif
     const void *host_w = tb_gguf_tensor_data(g, t);
-    if (dbg) { fprintf(stderr, "[mv] -> cpu\n"); fflush(stderr); g_matvec_dbg++; }
-    /* Use analog-dispatched matvec if context is set, else legacy scalar */
-    if (g_dispatch_snap && g_dispatch_caps) {
+    /* tb_dispatch_matvec has SIMD paths for common qtypes only.
+     * IQ3_S (21): tb_dispatch_matvec routes it to the Q3_K kernel which uses a
+     *   different block layout (d at byte 108 vs byte 0 for IQ3_S) → wrong weights.
+     * IQ4_XS (23): tb_dispatch_matvec has no case 23 → default: memset(0) → zeros.
+     * Both must bypass tb_dispatch_matvec and go to the reference dequant path. */
+    int use_dispatch = (g_dispatch_snap && g_dispatch_caps &&
+                        t->qtype != 21 && t->qtype != 23);
+    if (use_dispatch) {
         tb_dispatch_matvec(host_w, t->qtype, M, K, x, out,
                            g_dispatch_snap, g_dispatch_caps);
     } else {
         tb_gguf_dequant_matvec(host_w, t->qtype, M, K, x, out);
     }
-    if (dbg) { fprintf(stderr, "[mv] cpu done\n"); fflush(stderr); }
 }
 
 #ifdef TB_CUDA
@@ -476,7 +611,8 @@ int tb_gguf_cuda_upload_all(TB_GGUFLoaded *g)
         /* Only upload quant types handled by GPU kernels */
         switch (t->qtype) {
         case  1: case  2: case  8: case 11: case 12: case 13: case 14: case 15:
-        case 21: /* IQ3_S — 110 bytes/block, dispatched via Q3_K kernel */
+            /* IQ3_S (qtype=21) excluded: different block layout from Q3_K,
+             * Q3_K GPU kernel would misread the scale field → NaN. CPU path. */
             break;
         default: t->d_data = NULL; continue;
         }
@@ -491,7 +627,6 @@ int tb_gguf_cuda_upload_all(TB_GGUFLoaded *g)
         case  2: block_weights = 32;  block_bytes = 18;  break;  /* Q4_0 */
         case  8: block_weights = 32;  block_bytes = 34;  break;  /* Q8_0 */
         case 11: block_weights = 256; block_bytes = 110; break;  /* Q3_K */
-        case 21: block_weights = 256; block_bytes = 110; break;  /* IQ3_S — same block size as Q3_K */
         case 12: block_weights = 256; block_bytes = 144; break;  /* Q4_K */
         case 13: block_weights = 256; block_bytes = 176; break;  /* Q5_K */
         case 14: block_weights = 256; block_bytes = 210; break;  /* Q6_K */
@@ -661,8 +796,11 @@ TB_GGUFLoaded* tb_gguf_load(const char *path) {
         }
         else if (strstr(key,"rope.dimension_count")||strstr(key,"rope_dim")
                  ||strstr(key,"key_length")) {
-            /* rope_dim is the partial RoPE dimension, NOT the per-head QKV dimension — skip */
-            gguf_skip_val(f,vtype);
+            /* Partial RoPE: only the first rope_rotary_dim dimensions are rotated.
+             * Qwen3.5 sets rope.dimension_count=64 with head_dim=256.
+             * Store it so tb_infer.c can limit the rotation range. */
+            if (vtype==GGUF_UINT32||vtype==GGUF_INT32) { RD_UINT(g->rope_rotary_dim); }
+            else gguf_skip_val(f,vtype);
         }
         /* norm_eps: various patterns across architectures */
         else if (strstr(key,"rms_epsilon")||strstr(key,"rms_norm_eps")
@@ -679,6 +817,32 @@ TB_GGUFLoaded* tb_gguf_load(const char *path) {
         /* group_size for quantization — Qwen3 uses 64, older models 32 */
         else if (strstr(key,"quantization_config.group_size")||strstr(key,"group_size")) {
             if (vtype==GGUF_UINT32||vtype==GGUF_INT32) { RD_UINT(g->group_size); }
+            else gguf_skip_val(f,vtype);
+        }
+        /* full_attention_interval: Qwen3.5 hybrid — global attention every N layers */
+        else if (strstr(key,"full_attention_interval")) {
+            if (vtype==GGUF_UINT32||vtype==GGUF_INT32) { RD_UINT(g->full_attn_interval); }
+            else gguf_skip_val(f,vtype);
+        }
+        /* Qwen3.5 SSM parameters */
+        else if (strstr(key,"ssm.state_size")) {
+            if (vtype==GGUF_UINT32||vtype==GGUF_INT32) { RD_UINT(g->ssm_state_size); }
+            else gguf_skip_val(f,vtype);
+        }
+        else if (strstr(key,"ssm.inner_size")) {
+            if (vtype==GGUF_UINT32||vtype==GGUF_INT32) { RD_UINT(g->ssm_inner_size); }
+            else gguf_skip_val(f,vtype);
+        }
+        else if (strstr(key,"ssm.conv_kernel")) {
+            if (vtype==GGUF_UINT32||vtype==GGUF_INT32) { RD_UINT(g->ssm_conv_kernel); }
+            else gguf_skip_val(f,vtype);
+        }
+        else if (strstr(key,"ssm.group_count")) {
+            if (vtype==GGUF_UINT32||vtype==GGUF_INT32) { RD_UINT(g->ssm_group_count); }
+            else gguf_skip_val(f,vtype);
+        }
+        else if (strstr(key,"ssm.time_step_rank")) {
+            if (vtype==GGUF_UINT32||vtype==GGUF_INT32) { RD_UINT(g->ssm_time_step_rank); }
             else gguf_skip_val(f,vtype);
         }
         /* ── Tokenizer vocab ── */
@@ -735,6 +899,10 @@ TB_GGUFLoaded* tb_gguf_load(const char *path) {
             if (vtype==GGUF_UINT32||vtype==GGUF_INT32) { uint32_t v; fread(&v,4,1,f); g->eos_token_id=(int)v; }
             else gguf_skip_val(f,vtype);
         }
+        else if (strcmp(key,"tokenizer.chat_template")==0 && vtype==GGUF_STRING) {
+            /* Store raw Jinja2 template string; used by tb_infer.c to format prompts. */
+            g->chat_template = gguf_read_str(f);
+        }
         else {
             gguf_skip_val(f,vtype);
         }
@@ -745,6 +913,12 @@ TB_GGUFLoaded* tb_gguf_load(const char *path) {
     /* Always derive head_dim from hidden_dim/n_heads (rope_dim is a separate concept) */
     if (g->n_heads > 0 && g->hidden_dim > 0)
         g->head_dim = g->hidden_dim / g->n_heads;
+
+    fprintf(stderr, "[tb_gguf] parsed: layers=%d hidden=%d full_attn_interval=%d "
+            "ssm_inner=%d ssm_state=%d ssm_conv_k=%d ssm_groups=%d ssm_ts_rank=%d\n",
+            g->n_layers, g->hidden_dim, g->full_attn_interval,
+            g->ssm_inner_size, g->ssm_state_size, g->ssm_conv_kernel,
+            g->ssm_group_count, g->ssm_time_step_rank);
 
     /* ── Build tokenizer from extracted vocab ── */
     if (vocab_strs && g->vocab_size > 0) {
@@ -811,11 +985,11 @@ TB_GGUFLoaded* tb_gguf_load(const char *path) {
     }
 
     printf("[tb_gguf] %s: arch=%s layers=%d hidden=%d heads=%d/%d "
-           "experts=%d/%d tensors=%d size=%.1fGB\n",
+           "experts=%d/%d tensors=%d size=%.1fGB rope_base=%.0f\n",
            path, g->arch, g->n_layers, g->hidden_dim,
            g->n_heads, g->n_kv_heads,
            g->n_experts, g->n_experts_per_tok,
-           g->n_tensors, (double)g->file_size/1e9);
+           g->n_tensors, (double)g->file_size/1e9, g->rope_base);
 
     /* Build Fibonacci hash index for O(1) tensor lookup */
     tb_gguf_build_index(g);
@@ -823,6 +997,50 @@ TB_GGUFLoaded* tb_gguf_load(const char *path) {
         printf("[tb_gguf] tensor index: %d tensors in %u slots (%.0f%% load)\n",
                g->n_tensors, g->tensor_index_cap,
                100.0 * g->n_tensors / g->tensor_index_cap);
+
+    /* Re-derive n_heads and n_kv_heads from the first GLOBAL attention layer.
+ *
+ * Bug: the old code read blk.0.attn_qkv.weight, which for Qwen3.5-9B and
+ * other DeltaNet hybrids is a LOCAL layer with fused [Q_kdim|K_kdim|V_vdim]
+ * layout — completely different from the global [NH*HD|NK*HD|NK*HD] layout.
+ * This produced n_kv_heads=8 (wrong) overriding the correct KV value of 4,
+ * misallocating the KV cache and corrupting every global attention layer.
+ *
+ * Fix: use the first GLOBAL layer index (full_attn_interval-1 when set, else 0)
+ * and read its separate attn_q.weight / attn_k.weight shapes directly.
+ */
+    if (g->n_heads > 0 && g->hidden_dim > 0 && g->head_dim > 0) {
+        int global_l = (g->full_attn_interval > 0) ? (g->full_attn_interval - 1) : 0;
+        char tname[128];
+
+        /* Correct n_heads from attn_q.weight: total_elems / (hidden * head_dim) = n_heads.
+         * GGUF stores weight rows as outermost (shape[1] for 2D), but we use
+         * n_elems / (hidden * head_dim) which is shape-index-independent. */
+        snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", global_l);
+        const TB_GGUFTensorInfo *wq = tb_gguf_find_tensor(g, tname);
+        if (wq && g->head_dim > 0 && g->hidden_dim > 0) {
+            int64_t n_elems_q = tb_gguf_tensor_nelems(wq);
+            int nh_actual = (int)(n_elems_q / ((int64_t)g->hidden_dim * g->head_dim));
+            if (nh_actual > 0 && nh_actual != g->n_heads) {
+                fprintf(stderr, "[tb_gguf] n_heads corrected %d->%d from %s\n",
+                        g->n_heads, nh_actual, tname);
+                g->n_heads = nh_actual;
+            }
+        }
+
+        /* Correct n_kv_heads from attn_k.weight: total_elems / (hidden * head_dim). */
+        snprintf(tname, sizeof(tname), "blk.%d.attn_k.weight", global_l);
+        const TB_GGUFTensorInfo *wk = tb_gguf_find_tensor(g, tname);
+        if (wk && g->head_dim > 0 && g->hidden_dim > 0) {
+            int64_t n_elems_k = tb_gguf_tensor_nelems(wk);
+            int nkv_actual = (int)(n_elems_k / ((int64_t)g->hidden_dim * g->head_dim));
+            if (nkv_actual > 0 && nkv_actual != g->n_kv_heads) {
+                fprintf(stderr, "[tb_gguf] n_kv_heads corrected %d->%d from %s\n",
+                        g->n_kv_heads, nkv_actual, tname);
+                g->n_kv_heads = nkv_actual;
+            }
+        }
+    }
 
     return g;
 }
@@ -845,6 +1063,7 @@ void tb_gguf_free(TB_GGUFLoaded *g) {
         munmap(g->weights_data, g->file_size);
     if (g->weights_fd >= 0) close(g->weights_fd);
     if (g->tokenizer) { tb_tokenizer_free(g->tokenizer); free(g->tokenizer); }
+    free(g->chat_template);
     free(g->tensor_index);
     free(g->tensors);
     free(g);

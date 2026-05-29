@@ -49,6 +49,21 @@ typedef struct {
     int         branch_id;
     int         session_id;
     int         active;
+    /* Qwen3.5 Gated DeltaNet recurrent state:
+     *   ssm_h[layer][head][d_k][d_v] — row-major, float32
+     *   shape: [n_layers × n_heads × head_d_k × head_d_v]
+     * Only allocated when the model has SSM layers (full_attn_interval > 0). */
+    float      *ssm_h;           /* DeltaNet S matrices */
+    int         ssm_n_layers;    /* = m->n_layers */
+    int         ssm_n_heads;     /* n_ssm_heads (= ssm_a.shape[0]) */
+    int         ssm_head_d_k;    /* key-space dim per head */
+    int         ssm_head_d_v;    /* value-space dim per head (= ssm_state_size) */
+    /* Conv1d sliding-window state:
+     *   conv_h[layer][(kernel-1)][channel]
+     *   shape: [n_layers × (conv_kernel-1) × ssm_inner_size] */
+    float      *conv_h;          /* causal conv history buffer */
+    int         conv_hist;       /* = conv_kernel - 1 (= 3) */
+    int         conv_inner_size; /* = ssm_inner_size (= 8192) */
 } TB_SessionKV;
 
 /* ── Inference context ───────────────────────────────────────────────────── */
@@ -76,6 +91,14 @@ typedef struct {
     TB_CognitionTree *tree;
     /* Serialise generate calls: prevents data races on lattice/ctx state */
     pthread_mutex_t  generate_lock;
+    /* Current-session DeltaNet state pointers — set by tb_infer_decode before layer loop */
+    float  *cur_ssm_h;        /* points into session_kvs[slot].ssm_h (NULL if no SSM) */
+    float  *cur_conv_h;       /* points into session_kvs[slot].conv_h (NULL if no SSM) */
+    int     cur_ssm_n_heads;  /* n_ssm_heads */
+    int     cur_ssm_head_d_k; /* head_d_k */
+    int     cur_ssm_head_d_v; /* head_d_v */
+    int     cur_conv_hist;    /* conv_kernel - 1 */
+    int     cur_conv_inner;   /* ssm_inner_size */
     /* Pre-allocated decode scratch — avoids per-token malloc */
     float *scratch_x;      /* [hidden_dim] hidden state */
     float *scratch_y;      /* [hidden_dim] layer output swap buffer */
@@ -122,7 +145,7 @@ TB_ExpertSelection tb_route_experts(TB_InferCtx *ctx, int token_id,
                                      int n_experts);
 
 /* RoPE */
-void tb_rope_apply(float *q, float *k, int head_dim, int pos, float rope_base);
+void tb_rope_apply(float *q, float *k, int head_dim, int pos, float rope_base, int rotary_dim);
 
 /* BF16 helper (used in tb_infer.c and tb_gguf.c) */
 static inline float tb_bf16_to_f32_infer(uint16_t v) {
@@ -131,6 +154,12 @@ static inline float tb_bf16_to_f32_infer(uint16_t v) {
 
 /* Diff utility */
 void tb_diff_sources(const char *dir_a, const char *dir_b, const char *out_patch);
+
+/* Single-layer forward pass — exposed for per-layer batch testing.
+ * x/out: (hidden_dim,)  kv may be NULL (skips KV write, uses copy-attn fallback) */
+int tb_layer_forward(TB_InferCtx *ctx, int layer_idx,
+                     const float *x, float *out,
+                     TB_KVCache *kv, int pos, int token_id);
 
 #ifdef __cplusplus
 }

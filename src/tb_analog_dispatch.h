@@ -81,6 +81,7 @@ TBDispatchClass tb_dispatch_classify(const TBOscSnapshot *snap,
 
 /* Scalar: reference implementation, always correct. */
 float tb_dot_q4k_scalar(const uint8_t *row, int K, const float *x);
+float tb_dot_q5k_scalar(const uint8_t *row, int K, const float *x);
 float tb_dot_q3k_scalar(const uint8_t *row, int K, const float *x);
 float tb_dot_q8_scalar (const uint8_t *row, int K, const float *x);
 float tb_dot_bf16_scalar(const uint16_t *row, int K, const float *x);

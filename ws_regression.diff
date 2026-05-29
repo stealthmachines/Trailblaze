@@ -1,0 +1,50 @@
+diff --git a/layer4/tb_infer.c b/layer4/tb_infer.c
+index d86e29b..8116202 100644
+--- a/layer4/tb_infer.c
++++ b/layer4/tb_infer.c
+@@ -1655,44 +1655,42 @@ int main(int argc, char **argv) {
+     for (int i=0;i<8;i++) gate_logits[i]=0.1f*(i%3);
+     TB_ExpertSelection sel = tb_route_experts(ctx, 42, 0, gate_logits, 8);
+     printf("[routing] token=42 layer=0 → experts=[");
+     for (int i=0;i<sel.k;i++) printf("%d(%.3f)%s",sel.expert_indices[i],sel.expert_weights[i],i<sel.k-1?",":"");
+     printf("] hdgl_expert=%d octave=%d\n", sel.hdgl_expert, sel.semantic_octave);
+ 
+     /* Test generation */
+     if (!benchmark) {
+         printf("\n[generate] prompt: '%s'\n", prompt);
+         int tok_ids[2048]; int n_tok = 0;
+         TB_Tokenizer *tok = model ? model->tokenizer : NULL;
+         if (tok) n_tok = tb_tokenizer_encode(tok, prompt, 1, tok_ids, 2048);
+         if (n_tok <= 0) {
+             for (int i = 0; i < (int)strlen(prompt) && n_tok < 2048; i++)
+                 tok_ids[n_tok++] = ((unsigned char)prompt[i]) % model->vocab_size;
+         }
+         if (n_tok <= 0) { tok_ids[0] = 1; n_tok = 1; }
+ 
+         printf("[generate] output tokens: ");
+         int out_ids[2048];
+-        TB_CliTokenCtx cctx = {0};
+-        cctx.tok = tok;
+         int n_gen = tb_infer_generate(ctx, tok_ids, n_tok, out_ids, max_new_tokens, 0,
+-                                       print_token_cb, &cctx);
++                                       NULL, NULL);
+         if (tok && n_gen > 0) {
+             char *decoded = tb_tokenizer_decode(tok, out_ids, n_gen);
+             if (decoded) {
+                 printf("\n[generate] decoded: %s", decoded);
+                 free(decoded);
+             }
+         }
+         printf("\n[generate] %d tokens: PASS\n", n_gen);
+     } else {
+         fprintf(stderr, "[benchmark] skipping generate self-test\n");
+     }
+ 
+     /* Test lattice routing */
+     double M, L, S;
+     tb_lattice_s_u_resonance(ctx->lattice, &M, &L, &S);
+     printf("\n[lattice] S(U)=%.4f Λ=%.4f M=%.4f\n", S, L, M);
+ 
+     /* Benchmark */
+     if (benchmark) {
+         const int bench_tokens = bench_steps > 0 ? bench_steps : 1;

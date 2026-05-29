@@ -18,7 +18,8 @@
       "Bash(curl -s \"https://raw.githubusercontent.com/ggerganov/llama.cpp/master/ggml/src/ggml-cuda/vecdotq.cuh\")",
       "Bash(awk '/case LLM_ARCH_QWEN3:/,/case LLM_ARCH_QWEN3MOE:/')",
       "Bash(awk '/vec_dot_q3_K_q8_1[^_]/,/^}/')",
-      "Bash(awk '/switch \\\\\\(arch\\\\\\) \\\\{/,/^[[:space:]]*\\\\}/')"
+      "Bash(awk '/switch \\\\\\(arch\\\\\\) \\\\{/,/^[[:space:]]*\\\\}/')",
+      "Bash(nmake)"
     ]
   }
 }

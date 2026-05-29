@@ -155,6 +155,7 @@ void tb_softmax(float *x, int M, int N);
 void tb_attention(const float *q, const float *k, const float *v,
                   TB_KVCache *cache, int layer_idx,
                   int n_heads, int n_kv_heads, int head_dim,
+                  int pos,
                   float *out);
 
 /* ============================================================================

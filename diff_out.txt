@@ -1,0 +1,217 @@
+Comparing files C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c and C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c
+  578:      ctx->max_new_tokens    = 512;
+  579:      ctx->temperature       = 0.0f;  /* greedy for diagnostics */
+  580:      ctx->top_p             = 0.9f;
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+  578:      ctx->max_new_tokens    = 512;
+  579:      ctx->temperature       = 0.7f;
+  580:      ctx->top_p             = 0.9f;
+*****
+
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c
+  705:  }
+  706:  
+  707:  /* GQA attention with separate Q/K and V head dims (Qwen3.5: HD_k=256, HD_v=128).
+  708:   * q[n_heads*HD_k], k[NK_k*HD_k], v[NK_v*HD_v], out[n_heads*HD_v]. */
+  709:  static void tb_attention_split_kv(
+  710:      const float *q, const float *k, const float *v,
+  711:      TB_KVCache *cache, int layer_idx,
+  712:      int n_heads, int NK_k, int HD_k,
+  713:      int NK_v, int HD_v,
+  714:      int pos, float *out)
+  715:  {
+  716:  #define ATTN_TILE 32
+  717:      float scale = 1.0f / sqrtf((float)HD_k);
+  718:      int   total = pos + 1;
+  719:  
+  720:      for (int h = 0; h < NK_k; h++) {
+  721:          float *kslot = cache->keys[layer_idx]
+  722:                         + (size_t)h * cache->max_seq * HD_k
+  723:                         + (size_t)pos * HD_k;
+  724:          memcpy(kslot, k + h * HD_k, HD_k * sizeof(float));
+  725:      }
+  726:      for (int h = 0; h < NK_v; h++) {
+  727:          float *vslot = cache->vals[layer_idx]
+  728:                         + (size_t)h * cache->max_seq * HD_v
+  729:                         + (size_t)pos * HD_v;
+  730:          memcpy(vslot, v + h * HD_v, HD_v * sizeof(float));
+  731:      }
+  732:      if (layer_idx == 0) cache->seq_len++;
+  733:  
+  734:      float tile_scores[ATTN_TILE];
+  735:      for (int h = 0; h < n_heads; h++) {
+  736:          int kv_k = (NK_k > 0) ? (h * NK_k / n_heads) : 0;
+  737:          int kv_v = (NK_v > 0) ? (h * NK_v / n_heads) : 0;
+  738:          const float *qh  = q + (size_t)h * HD_k;
+  739:          float       *outh = out + (size_t)h * HD_v;
+  740:          memset(outh, 0, HD_v * sizeof(float));
+  741:  
+  742:          float m_i = -1e38f, l_i = 0.0f;
+  743:          for (int t0 = 0; t0 < total; t0 += ATTN_TILE) {
+  744:              int tend = t0 + ATTN_TILE; if (tend > total) tend = total;
+  745:              int tn = tend - t0;
+  746:              for (int ti = 0; ti < tn; ti++) {
+  747:                  const float *kt = cache->keys[layer_idx]
+  748:                      + (size_t)kv_k * cache->max_seq * HD_k
+  749:                      + (size_t)(t0 + ti) * HD_k;
+  750:                  float dot = 0.0f;
+  751:                  for (int d = 0; d < HD_k; d++) dot += qh[d] * kt[d];
+  752:                  tile_scores[ti] = dot * scale;
+  753:              }
+  754:              float m_new = m_i;
+  755:              for (int ti = 0; ti < tn; ti++) if (tile_scores[ti] > m_new) m_new = tile_scores[ti];
+  756:              float rsc = expf(m_i - m_new), l_new = rsc * l_i;
+  757:              for (int ti = 0; ti < tn; ti++) { tile_scores[ti] = expf(tile_scores[ti] - m_new); l_new += tile_scores[ti]; }
+  758:              for (int d = 0; d < HD_v; d++) outh[d] *= rsc;
+  759:              for (int ti = 0; ti < tn; ti++) {
+  760:                  const float *vt = cache->vals[layer_idx]
+  761:                      + (size_t)kv_v * cache->max_seq * HD_v
+  762:                      + (size_t)(t0 + ti) * HD_v;
+  763:                  float a = tile_scores[ti];
+  764:                  for (int d = 0; d < HD_v; d++) outh[d] += a * vt[d];
+  765:              }
+  766:              m_i = m_new; l_i = l_new;
+  767:          }
+  768:          if (l_i > 0.0f) { float inv_l = 1.0f/l_i; for (int d=0;d<HD_v;d++) outh[d]*=inv_l; }
+  769:      }
+  770:  #undef ATTN_TILE
+  771:  }
+  772:  
+  773:  int tb_layer_forward(
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+  705:  }
+  706:  int tb_layer_forward(
+*****
+
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c
+  860:  
+  861:          /* Derive actual NH and NK from the Q/K weight shapes.
+  862:           * GGUF stores weights as [input, output] (innermost first), so
+  863:           * total_elements / (H * HD) gives the correct head count.
+  864:           * This handles models where GGUF KV n_heads != actual Q-head count. */
+  865:          if (wq_t && wq_t->n_dims >= 2 && HD > 0) {
+  866:              int nh_actual = (int)(tb_gguf_tensor_nelems(wq_t) / ((int64_t)H * HD));
+  867:              if (nh_actual > 0 && nh_actual != NH) {
+  868:                  if (pos == 0 && layer_idx < 5)
+  869:                      fprintf(stderr, "[tb_infer] L%d NH corrected %d->%d from wq shape\n",
+  870:                              layer_idx, NH, nh_actual);
+  871:                  NH = nh_actual;
+  872:              }
+  873:          }
+  874:          if (wk_t && wk_t->n_dims >= 2 && HD > 0) {
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+  793:  
+  794:          /* Note: Q weight has M=8192 but NH*HD=16*256=4096. We use only the first
+  795:           * NH*HD rows of W_q (the actual attention Q). The extra rows in W_q are
+  796:           * architecture-specific and not needed for basic inference. NK is always
+  797:           * derived from the K weight shape to handle GQA correctly. */
+  798:          if (wk_t && wk_t->n_dims >= 2 && HD > 0) {
+*****
+
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c
+  877:          }
+  878:          /* Derive value head dim from output projection weight.
+  879:           * e.g. Qwen3.5: HD_k=256 for Q*K scoring, HD_v=128 for V output,
+  880:           * NK_k=4, NK_v=8, NK_k*HD_k == NK_v*HD_v == 1024. */
+  881:          int HD_v = HD, NK_v = NK;
+  882:          {
+  883:              char wo_tname[64];
+  884:              snprintf(wo_tname, sizeof(wo_tname), "blk.%d.attn_output.weight", layer_idx);
+  885:              const TB_GGUFTensorInfo *wo_pre = tb_gguf_find_tensor(m, wo_tname);
+  886:              if (!wo_pre) {
+  887:                  snprintf(wo_tname, sizeof(wo_tname), "blk.%d.attn_out.weight", layer_idx);
+  888:                  wo_pre = tb_gguf_find_tensor(m, wo_tname);
+  889:              }
+  890:              if (wo_pre && H > 0 && NH > 0) {
+  891:                  int64_t wok = tb_gguf_tensor_nelems(wo_pre) / (int64_t)H;
+  892:                  int hdv = (wok > 0) ? (int)(wok / NH) : HD;
+  893:                  if (hdv > 0 && hdv != HD && HD > 0 && NK > 0) {
+  894:                      HD_v = hdv;
+  895:                      NK_v = NK * HD / HD_v;
+  896:                      if (pos == 0 && layer_idx < 5)
+  897:                          fprintf(stderr, "[tb_infer] L%d split-KV HD_k=%d HD_v=%d NK_k=%d NK_v=%d\n",
+  898:                                  layer_idx, HD, HD_v, NK, NK_v);
+  899:                  }
+  900:              }
+  901:          }
+  902:          q        = (float*)calloc(NH*HD,   sizeof(float));
+  903:          k        = (float*)calloc(NK*HD,   sizeof(float));
+  904:          v        = (float*)calloc(NK*HD,   sizeof(float));
+  905:          attn_out = (float*)calloc(NH*HD_v, sizeof(float));
+  906:  
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+  801:          }
+  802:          q        = (float*)calloc(NH*HD, sizeof(float));
+  803:          k        = (float*)calloc(NK*HD, sizeof(float));
+  804:          v        = (float*)calloc(NK*HD, sizeof(float));
+  805:          attn_out = (float*)calloc(NH*HD, sizeof(float));
+  806:  
+*****
+
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c
+  976:  
+  977:          /* Softmax attention (split-KV: HD_k may differ from HD_v) */
+  978:          if (kv) {
+  979:              tb_attention_split_kv(q, k, v, kv, layer_idx, NH, NK, HD, NK_v, HD_v, pos, attn_out);
+  980:          } else {
+  981:              memcpy(attn_out, q, (size_t)NH*HD_v*sizeof(float));
+  982:          }
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+  876:  
+  877:          /* Softmax attention */
+  878:          if (kv) {
+  879:              tb_attention(q, k, v, kv, layer_idx, NH, NK, HD, pos, attn_out);
+  880:          } else {
+  881:              memcpy(attn_out, q, NH*HD*sizeof(float));
+  882:          }
+*****
+
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c
+ 1420:  
+ 1421:      /* Per-layer diagnostics for the last prompt position (pos==5) */
+ 1422:      if (pos == 5) {
+ 1423:          float ss = 0.0f;
+ 1424:          for (int i=0;i<H;i++) ss += out[i]*out[i];
+ 1425:          float norm_out = sqrtf(ss / H);
+ 1426:          /* Also measure attn contribution */
+ 1427:          float sa = 0.0f;
+ 1428:          for (int i=0;i<H;i++) sa += attn_proj[i]*attn_proj[i];
+ 1429:          fprintf(stderr, "[diag p5 L%d] out_rms=%.4f attn_rms=%.4f is_local=%d\n",
+ 1430:                  layer_idx, norm_out, sqrtf(sa/H), is_local);
+ 1431:      }
+ 1432:  
+ 1433:      free(xn); free(ones); free(q); free(k); free(v);
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+ 1320:  
+ 1321:      free(xn); free(ones); free(q); free(k); free(v);
+*****
+
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c
+ 2428:      float override_temp = -1.0f;   /* -1 means "use default" */
+ 2429:      int   add_bos = 1;             /* prepend BOS token */
+ 2430:      const char *prompt = "The future of AI inference is";
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+ 2316:      float override_temp = -1.0f;   /* -1 means "use default" */
+ 2317:      const char *prompt = "The future of AI inference is";
+*****
+
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c
+ 2449:          }
+ 2450:          else if (!strcmp(argv[i],"--no-bos"))                add_bos = 0;
+ 2451:          else if (!strcmp(argv[i],"--verbose") || !strcmp(argv[i],"--trace-decode")) g_tb_verbose = 1;
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+ 2336:          }
+ 2337:          else if (!strcmp(argv[i],"--verbose") || !strcmp(argv[i],"--trace-decode")) g_tb_verbose = 1;
+*****
+
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.8\LAYER4\tb_infer.c
+ 2514:          TB_Tokenizer *tok = model ? model->tokenizer : NULL;
+ 2515:          if (tok) n_tok = tb_tokenizer_encode(tok, prompt, add_bos, tok_ids, 2048);
+ 2516:          if (n_tok <= 0) {
+***** C:\USERS\OWNER\DOCUMENTS\TRAILBLAZER\V0.9\EXTRACTED6\V0.8_FIXED\LAYER4\TB_INFER.C
+ 2400:          TB_Tokenizer *tok = model ? model->tokenizer : NULL;
+ 2401:          if (tok) n_tok = tb_tokenizer_encode(tok, prompt, 1, tok_ids, 2048);
+ 2402:          if (n_tok <= 0) {
+*****
+
